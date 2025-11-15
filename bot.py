@@ -28,6 +28,7 @@ from Crypto.Util.Padding import pad
 # --- ধাপ ১: কনফিগারেশন ---
 BOT_TOKEN = "8562291183:AAH1MqOjVjEWjhZRDBcOiBzi2sV94YaeacA"
 ADMIN_ID = 8308179143
+ADMIN_USERNAME = "Sujay_X" # <-- আপনার ইউজারনেম
 
 SECRET_KEY = "djchdnfkxnjhgvuy".encode('utf-8')
 IV = "ayghjuiklobghfrt".encode('utf-8')
@@ -62,8 +63,7 @@ bot = Bot(token=BOT_TOKEN)
 
 STOP_REQUESTS = {} # {user_id: True}
 
-# --- *** নতুন: MongoDB সেটআপ *** ---
-# এই কোডটি Render.com-এর "Environment Variable" থেকে লিঙ্কটি লোড করবে
+# --- MongoDB সেটআপ ---
 MONGO_URI = os.environ.get("MONGO_URI") 
 if not MONGO_URI:
     logging.critical("!!! MONGO_URI এনভায়রনমেন্ট ভেরিয়েবল সেট করা নেই! বট বন্ধ হয়ে যাচ্ছে।")
@@ -71,9 +71,9 @@ if not MONGO_URI:
 
 try:
     client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-    db = client["MyBotDatabase"] # আপনার ডাটাবেসের নাম
-    approved_collection = db["approved_users"] # ইউজার লিস্ট সেভ করার টেবিল
-    proxies_collection = db["user_proxies"] # প্রক্সি সেভ করার টেবিল
+    db = client["MyBotDatabase"] 
+    approved_collection = db["approved_users"] 
+    proxies_collection = db["user_proxies"] 
 except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
@@ -84,7 +84,7 @@ USER_PROXIES = {}
 # --- লগিং সেটআপ ---
 logging.basicConfig(level=logging.INFO)
 
-# --- Render.com-কে জাগিয়ে রাখার জন্য Flask অ্যাপ ---
+# --- Flask অ্যাপ (Keep Alive) ---
 app = Flask(__name__)
 @app.route('/')
 def keep_alive():
@@ -92,19 +92,16 @@ def keep_alive():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
-# --- ধাপ ২: নতুন ডেটা লোড ফাংশন (DB থেকে) ---
+# --- ধাপ ২: ডেটা লোড ফাংশন (DB থেকে) ---
 async def load_data_from_db():
-    """বট চালু হওয়ার সময় DB থেকে সব ডেটা লোড করে"""
     global APPROVED_USERS, USER_PROXIES
     try:
-        # অ্যাপ্রুভড ইউজার লোড করা
         cursor = approved_collection.find({}, {"_id": 0, "user_id": 1})
         APPROVED_USERS = {doc["user_id"] for doc in await cursor.to_list(None)}
         if ADMIN_ID not in APPROVED_USERS:
             await approved_collection.insert_one({"user_id": ADMIN_ID})
             APPROVED_USERS.add(ADMIN_ID)
         
-        # ইউজার প্রক্সি লোড করা
         cursor = proxies_collection.find({})
         for doc in await cursor.to_list(None):
             USER_PROXIES[doc["user_id"]] = doc["proxy_data"]
@@ -159,6 +156,14 @@ def get_site_selection_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Job77", callback_data="select_site:job777")],
         [InlineKeyboardButton(text="Sms323", callback_data="select_site:sms323")],
         [InlineKeyboardButton(text="Tg377", callback_data="select_site:tg377")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# --- *** নতুন: কন্টাক্ট অ্যাডমিন বাটন *** ---
+def get_contact_admin_keyboard() -> InlineKeyboardMarkup:
+    """'Contact Admin' বাটন তৈরি করে"""
+    buttons = [
+        [InlineKeyboardButton(text="📞 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -384,7 +389,8 @@ async def send_welcome(message: types.Message, state: FSMContext):
     if user_id not in APPROVED_USERS:
         await state.clear() 
         await message.answer("👋 স্বাগতম! এই বটটি ব্যবহার করার জন্য অ্যাডমিনের অ্যাপ্রুভাল প্রয়োজন।\n"
-                             "⏳ আপনার রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...")
+                             "⏳ আপনার রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...",
+                             reply_markup=get_contact_admin_keyboard()) # <-- *** পরিবর্তন এখানে ***
         try:
             await bot.send_message(ADMIN_ID, f"❗️ **New User Request** ❗️\n\n"
                                    f"**Name:** {user_name}\n**User ID:** `{user_id}`\n\n"
