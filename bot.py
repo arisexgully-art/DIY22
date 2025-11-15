@@ -26,7 +26,12 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
 # --- ধাপ ১: কনফিগারেশন ---
-BOT_TOKEN = "8562291183:AAH1MqOjVjEWjhZRDBcOiBzi2sV94YaeacA"
+# --- *** টোকেন এখন Render.com থেকে লোড হবে *** ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN") 
+if not BOT_TOKEN:
+    logging.critical("!!! BOT_TOKEN এনভায়রনমেন্ট ভেরিয়েবল সেট করা নেই! বট বন্ধ হয়ে যাচ্ছে।")
+    exit()
+
 ADMIN_ID = 8308179143
 ADMIN_USERNAME = "Sujay_X" # <-- আপনার ইউজারনেম
 
@@ -159,9 +164,7 @@ def get_site_selection_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# --- *** নতুন: কন্টাক্ট অ্যাডমিন বাটন *** ---
 def get_contact_admin_keyboard() -> InlineKeyboardMarkup:
-    """'Contact Admin' বাটন তৈরি করে"""
     buttons = [
         [InlineKeyboardButton(text="📞 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")]
     ]
@@ -390,7 +393,7 @@ async def send_welcome(message: types.Message, state: FSMContext):
         await state.clear() 
         await message.answer("👋 স্বাগতম! এই বটটি ব্যবহার করার জন্য অ্যাডমিনের অ্যাপ্রুভাল প্রয়োজন।\n"
                              "⏳ আপনার রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...",
-                             reply_markup=get_contact_admin_keyboard()) # <-- *** পরিবর্তন এখানে ***
+                             reply_markup=get_contact_admin_keyboard()) # <-- কন্টাক্ট বাটন সহ
         try:
             await bot.send_message(ADMIN_ID, f"❗️ **New User Request** ❗️\n\n"
                                    f"**Name:** {user_name}\n**User ID:** `{user_id}`\n\n"
@@ -520,6 +523,7 @@ async def start_creation_process(query: types.CallbackQuery, state: FSMContext):
 
     await state.update_data(selected_site=site_key)
     
+    # --- *** কীবোর্ড ফিক্স: এখন আর ReplyKeyboardRemove() নেই *** ---
     handler_msg = await query.message.answer(
         f"🔑 ({SITE_CONFIGS[site_key]['name']}) দয়া করে আপনার রেফার কোডটি টাইপ করুন:", 
         reply_markup=get_fsm_cancel_keyboard()
