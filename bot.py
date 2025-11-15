@@ -10,6 +10,9 @@ import threading # <-- Flask চালানোর জন্য জরুরি
 
 from flask import Flask # <-- Render.com-কে জাগিয়ে রাখার জন্য
 
+# --- নতুন: MongoDB লাইব্রেরি ---
+import motor.motor_asyncio
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
@@ -59,10 +62,22 @@ bot = Bot(token=BOT_TOKEN)
 
 STOP_REQUESTS = {} # {user_id: True}
 
-# --- *** Render.com Persistent Disk সেটআপ *** ---
-DATA_DIR = "/var/data"  # <-- Render.com-এর ডিস্ক এখানে মাউন্ট হবে
-APPROVED_USERS_FILE = os.path.join(DATA_DIR, "approved_users.json")
-USER_PROXIES_FILE = os.path.join(DATA_DIR, "user_proxies.json")
+# --- *** নতুন: MongoDB সেটআপ *** ---
+# এই কোডটি Render.com-এর "Environment Variable" থেকে লিঙ্কটি লোড করবে
+MONGO_URI = os.environ.get("MONGO_URI") 
+if not MONGO_URI:
+    logging.critical("!!! MONGO_URI এনভায়রনমেন্ট ভেরিয়েবল সেট করা নেই! বট বন্ধ হয়ে যাচ্ছে।")
+    exit()
+
+try:
+    client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+    db = client["MyBotDatabase"] # আপনার ডাটাবেসের নাম
+    approved_collection = db["approved_users"] # ইউজার লিস্ট সেভ করার টেবিল
+    proxies_collection = db["user_proxies"] # প্রক্সি সেভ করার টেবিল
+except Exception as e:
+    logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
+    exit()
+
 APPROVED_USERS = set()
 USER_PROXIES = {} 
 
@@ -71,51 +86,35 @@ logging.basicConfig(level=logging.INFO)
 
 # --- Render.com-কে জাগিয়ে রাখার জন্য Flask অ্যাপ ---
 app = Flask(__name__)
-
 @app.route('/')
 def keep_alive():
-    """Render.com এই এন্ডপয়েন্টটি পিং করবে"""
     return "Bot is alive!"
-
 def run_flask():
-    """Flask সার্ভারটি একটি আলাদা থ্রেডে চালাবে"""
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
-# --- ধাপ ২: ডেটা সেভ/লোড ফাংশন ---
-def save_json_data(data, filename):
+# --- ধাপ ২: নতুন ডেটা লোড ফাংশন (DB থেকে) ---
+async def load_data_from_db():
+    """বট চালু হওয়ার সময় DB থেকে সব ডেটা লোড করে"""
+    global APPROVED_USERS, USER_PROXIES
     try:
-        os.makedirs(DATA_DIR, exist_ok=True) # ফোল্ডার তৈরি করা
-        with open(filename, 'w') as f:
-            json.dump(data, f)
-        logging.info(f"✅ {filename}-এ ডেটা সেভ করা হয়েছে।")
+        # অ্যাপ্রুভড ইউজার লোড করা
+        cursor = approved_collection.find({}, {"_id": 0, "user_id": 1})
+        APPROVED_USERS = {doc["user_id"] for doc in await cursor.to_list(None)}
+        if ADMIN_ID not in APPROVED_USERS:
+            await approved_collection.insert_one({"user_id": ADMIN_ID})
+            APPROVED_USERS.add(ADMIN_ID)
+        
+        # ইউজার প্রক্সি লোড করা
+        cursor = proxies_collection.find({})
+        for doc in await cursor.to_list(None):
+            USER_PROXIES[doc["user_id"]] = doc["proxy_data"]
+            
+        logging.info(f"✅ DB থেকে {len(APPROVED_USERS)} জন ইউজার ও {len(USER_PROXIES)} টি প্রক্সি লোড হয়েছে।")
+    
     except Exception as e:
-        logging.error(f"{filename} সেভ করায় সমস্যা: {e}")
-
-def load_approved_users():
-    global APPROVED_USERS
-    try:
-        with open(APPROVED_USERS_FILE, 'r') as f:
-            APPROVED_USERS = set(json.load(f))
-            logging.info(f"✅ {len(APPROVED_USERS)} জন অ্যাপ্রুভড ইউজার লোড করা হয়েছে।")
-    except FileNotFoundError:
-        logging.warning(f"⚠️ '{APPROVED_USERS_FILE}' ফাইল পাওয়া যায়নি। নতুন ফাইল তৈরি করা হবে।")
+        logging.error(f"DB থেকে ডেটা লোড করায় সমস্যা: {e}")
         APPROVED_USERS = {ADMIN_ID}
-        save_json_data(list(APPROVED_USERS), APPROVED_USERS_FILE)
-    except Exception as e:
-        logging.error(f"অ্যাপ্রুভড ইউজার লোড করায় সমস্যা: {e}")
-
-def load_user_proxies():
-    global USER_PROXIES
-    try:
-        with open(USER_PROXIES_FILE, 'r') as f:
-            USER_PROXIES = json.load(f)
-            logging.info(f"✅ {len(USER_PROXIES)} জন ইউজারের প্রক্সি লোড করা হয়েছে।")
-    except FileNotFoundError:
-        logging.warning(f"⚠️ '{USER_PROXIES_FILE}' ফাইল পাওয়া যায়নি। নতুন ফাইল তৈরি করা হবে।")
         USER_PROXIES = {}
-        save_json_data(USER_PROXIES, USER_PROXIES_FILE)
-    except Exception as e:
-        logging.error(f"ইউজার প্রক্সি লোড করায় সমস্যা: {e}")
 
 # --- ধাপ ৩: FSM স্টেট ---
 class UserData(StatesGroup):
@@ -133,32 +132,27 @@ def get_user_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="⚙️ Set/Update Proxy"), KeyboardButton(text="🔄 Change Proxy")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
 def get_admin_keyboard() -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="📊 List Approved Users")],
         [KeyboardButton(text="🚀 ACCOUNT CREATE (Admin)")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
 def get_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=f"✅ Approve User ({user_id})", callback_data=f"approve:{user_id}")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 def get_stop_keyboard(user_id: int) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="⏹️ Cancel Operation", callback_data=f"stop:{user_id}")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 def get_fsm_cancel_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="⏹️ Cancel Operation", callback_data="cancel_fsm")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 def get_site_selection_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="Diy22", callback_data="select_site:diy22")],
@@ -179,7 +173,6 @@ def encrypt_data(data_str: str) -> str:
     except Exception as e:
         logging.error(f"এনক্রিপশনে সমস্যা: {e}")
         return None
-
 def generate_random_number(length: int = 10) -> str:
     return "".join(random.choices("0123456789", k=length))
 
@@ -366,7 +359,8 @@ async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
         await query.message.edit_text(f"✅ ইউজার {user_id_to_approve} ইতিমধ্যেই অ্যাপ্রুভড।", reply_markup=None)
         await query.answer("User was already approved.")
     else:
-        APPROVED_USERS.add(user_id_to_approve); save_json_data(list(APPROVED_USERS), APPROVED_USERS_FILE)
+        await approved_collection.insert_one({"user_id": user_id_to_approve})
+        APPROVED_USERS.add(user_id_to_approve) 
         await query.message.edit_text(f"✅ ইউজার {user_id_to_approve} কে অ্যাপ্রুভ করা হয়েছে।", reply_markup=None)
         try:
             await bot.send_message(user_id_to_approve, "🎉 অভিনন্দন! অ্যাডমিন আপনার রিকোয়েস্ট অ্যাপ্রুভ করেছে।\n\n"
@@ -477,8 +471,13 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
         "user": user_data['proxy_user'],
         "pass": message.text 
     }
-    USER_PROXIES[str(message.from_user.id)] = proxy_info
-    save_json_data(USER_PROXIES, USER_PROXIES_FILE)
+    user_id_str = str(message.from_user.id)
+    USER_PROXIES[user_id_str] = proxy_info
+    await proxies_collection.update_one(
+        {"user_id": user_id_str},
+        {"$set": {"proxy_data": proxy_info}},
+        upsert=True
+    )
     
     await message.answer(f"✅ **প্রক্সি সফলভাবে সেভ হয়েছে!**\n\n"
                          f"**Host:** `{proxy_info['host']}`\n**Port:** `{proxy_info['port']}`\n"
@@ -597,14 +596,14 @@ async def process_amount_and_queue(message: types.Message, state: FSMContext):
 # --- ধাপ ৯: বট চালু করা ---
 async def main():
     """বট চালু করে"""
-    load_approved_users()
-    load_user_proxies() 
+    await load_data_from_db() # <-- DB থেকে সব ডেটা লোড করা
+    
     try:
         await bot.send_message(ADMIN_ID, f"✅ বট রিস্টার্ট/চালু হয়েছে! ({len(APPROVED_USERS)} জন ইউজার অ্যাপ্রুভড, {len(USER_PROXIES)} টি প্রক্সি লোডেড)")
     except Exception as e:
         logging.warning(f"অ্যাডমিনকে ({ADMIN_ID}) মেসেজ পাঠানো যায়নি: {e}")
     
-    # --- *** Flask সার্ভারটি থ্রেডে চালু করা *** ---
+    # --- Flask সার্ভারটি থ্রেডে চালু করা ---
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
     
