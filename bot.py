@@ -7,17 +7,12 @@ import io
 import json
 import os 
 import threading
-from datetime import datetime, timedelta # <-- টাইমারের জন্য জরুরি
 
 from flask import Flask 
 
 import motor.motor_asyncio
 
 from aiogram import Bot, Dispatcher, types, F
-# --- *** নতুন: Middleware ইম্পোর্ট করা হলো *** ---
-from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from typing import Callable, Dict, Any, Awaitable
-
 from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.fsm.context import FSMContext
@@ -80,13 +75,12 @@ if not MONGO_URI:
 try:
     client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
     db = client["MyBotDatabase"] 
-    approved_collection = db["approved_users"] # <-- এটি এখন ইউজারের সময়ও সেভ করবে
+    approved_collection = db["approved_users"] 
     proxies_collection = db["user_proxies"] 
 except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
 
-# --- *** পরিবর্তন: APPROVED_USERS এখন একটি ডিকশনারি *** ---
 APPROVED_USERS = {} # { user_id: expires_at_timestamp }
 USER_PROXIES = {} 
 
@@ -105,13 +99,9 @@ def run_flask():
 async def load_data_from_db():
     global APPROVED_USERS, USER_PROXIES
     try:
-        # --- *** পরিবর্তন: এখন 'expires_at' লোড করা হচ্ছে *** ---
         cursor = approved_collection.find({}, {"_id": 0, "user_id": 1, "expires_at": 1})
-        # ডিফল্ট 0 মানে অ্যাক্সেস নেই
         APPROVED_USERS = {doc["user_id"]: doc.get("expires_at", 0) for doc in await cursor.to_list(None)}
         
-        # অ্যাডমিনকে সব সময় পার্মানেন্ট অ্যাক্সেস দেওয়া
-        # (datetime.max.timestamp() একটি বিশাল বড় সংখ্যা যা কখনো এক্সপায়ার হবে না)
         APPROVED_USERS[ADMIN_ID] = datetime.max.timestamp() 
         
         cursor = proxies_collection.find({})
@@ -125,58 +115,14 @@ async def load_data_from_db():
         APPROVED_USERS = {ADMIN_ID: datetime.max.timestamp()}
         USER_PROXIES = {}
 
-# --- *** নতুন: অ্যাক্সেস চেক করার ফাংশন *** ---
+# --- অ্যাক্সেস চেক করার ফাংশন ---
 def is_user_currently_approved(user_id: int) -> bool:
     if user_id not in APPROVED_USERS:
-        return False # ইউজার লিস্টেই নেই
-    
+        return False
     expires_at = APPROVED_USERS.get(user_id, 0)
-    
-    # বর্তমান সময়ের থেকে বেশি টাইম থাকলেই শুধু অ্যাপ্রুভড
     return datetime.now().timestamp() < expires_at
 
-# --- *** নতুন: অ্যাক্সেস কন্ট্রোল Middleware *** ---
-class AccessMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[types.TelegramObject, Dict[str, Any]], Awaitable[Any]],
-        event: types.Message | types.CallbackQuery,
-        data: Dict[str, Any]
-    ) -> Any:
-        
-        user_id = event.from_user.id
-        
-        # অ্যাডমিনকে সব সময় অ্যালাও করা
-        if user_id == ADMIN_ID:
-            return await handler(event, data)
-            
-        # যে কম্যান্ডগুলি সবার জন্য খোলা থাকা উচিত
-        if isinstance(event, types.Message) and data.get("command") and data["command"].command == "start":
-            return await handler(event, data) # /start হ্যান্ডলারকে নিজে ম্যানেজ করতে দেওয়া
-        if isinstance(event, types.CallbackQuery) and (event.data.startswith("approve:") or event.data == "cancel_fsm"):
-            return await handler(event, data) # অ্যাডমিন বাটন ও ক্যানসেল বাটন
-        
-        # প্রক্সি সেটআপ ফ্লো-কে অ্যালাও করা
-        state: FSMContext = data.get('state')
-        if state:
-            current_state = await state.get_state()
-            if current_state and current_state.startswith("UserData:getting_proxy"):
-                return await handler(event, data)
-
-        # বাকি সবকিছুর জন্য অ্যাক্সেস চেক করা
-        if not is_user_currently_approved(user_id):
-            if user_id in APPROVED_USERS: # এর মানে ইউজারের অ্যাক্সেস ছিল, কিন্তু এক্সপায়ার হয়ে গেছে
-                await event.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে।\n"
-                                   "অ্যাডমিনের সাথে যোগাযোগ করুন বা /start চেপে রিনিউ করুন।", 
-                                   show_alert=True if isinstance(event, types.CallbackQuery) else False)
-            else: # ইউজার কখনোই অ্যাপ্রুভড ছিল না
-                await event.answer("❌ আপনার এই বটটি ব্যবহার করার অনুমতি নেই।\n"
-                                   "অনুগ্রহ করে /start চেপে অ্যাডমিনের অ্যাপ্রুভালের জন্য রিকোয়েস্ট করুন।", 
-                                   show_alert=True if isinstance(event, types.CallbackQuery) else False)
-            return # হ্যান্ডলারটি আর কল করা হবে না
-
-        # ইউজার অ্যাপ্রুভড এবং অ্যাক্সেস আছে
-        return await handler(event, data)
+# --- *** AccessMiddleware ক্লাসটি সরিয়ে ফেলা হয়েছে *** ---
 
 # --- ধাপ ৩: FSM স্টেট ---
 class UserData(StatesGroup):
@@ -187,7 +133,7 @@ class UserData(StatesGroup):
     waiting_for_referral = State()
     waiting_for_amount = State()
 
-# --- ধাপ ৪: কীবোর্ড (***পরিবর্তিত***) ---
+# --- ধাপ ৪: কীবোর্ড ---
 def get_user_keyboard() -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="🚀 ACCOUNT CREATE")],
@@ -200,9 +146,7 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🚀 ACCOUNT CREATE (Admin)")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
 def get_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """নতুন: টাইমার সহ অ্যাপ্রুভাল বাটন"""
     buttons = [
         [
             InlineKeyboardButton(text="✅ 1H", callback_data=f"approve:{user_id}:3600"),
@@ -212,7 +156,6 @@ def get_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 def get_stop_keyboard(user_id: int) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="⏹️ Cancel Operation", callback_data=f"stop:{user_id}")]
@@ -428,10 +371,8 @@ async def list_approved_users(message: types.Message, state: FSMContext):
         
         if expires_at > now:
             remaining_time = expires_at - now
-            if remaining_time > 86400: # 1 দিনের বেশি
-                status = f"✅ Active ({remaining_time / 86400:.1f} days left)"
-            else:
-                status = f"✅ Active ({remaining_time / 3600:.1f} hours left)"
+            if remaining_time > 86400: status = f"✅ Active ({remaining_time / 86400:.1f} days left)"
+            else: status = f"✅ Active ({remaining_time / 3600:.1f} hours left)"
         else:
             status = "❌ Expired"
         text += f"- `{user_id}` ({status})\n"
@@ -448,11 +389,9 @@ async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
     except Exception as e:
         await query.answer("Error parsing callback.", show_alert=True); logging.error(f"Callback error: {e}"); return
 
-    # --- নতুন: టైম ক্যালকুলেশন ---
     expires_at = datetime.now().timestamp() + duration_seconds
     duration_hours = duration_seconds / 3600
     
-    # DB এবং লোকাল ক্যাশে আপডেট
     await approved_collection.update_one(
         {"user_id": user_id_to_approve},
         {"$set": {"expires_at": expires_at}},
@@ -463,7 +402,6 @@ async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
     await query.message.edit_text(f"✅ ইউজার {user_id_to_approve} কে {duration_hours:.0f} ঘণ্টার জন্য অ্যাপ্রুভ করা হয়েছে।", reply_markup=None)
     
     try:
-        # ইউজারকে জানানো
         await bot.send_message(user_id_to_approve, 
                                f"🎉 অভিনন্দন! অ্যাডমিন আপনার অ্যাক্সেস {duration_hours:.0f} ঘণ্টার জন্য অ্যাপ্রুভ/রিনিউ করেছে।\n\n"
                                "বটটি ব্যবহার করতে /start চাপুন।")
@@ -481,9 +419,7 @@ async def send_welcome(message: types.Message, state: FSMContext):
                              reply_markup=get_admin_keyboard())
         return
 
-    # --- *** নতুন: /start-এর সম্পূর্ণ নতুন লজিক *** ---
     if user_id not in APPROVED_USERS:
-        # কেস ১: ইউজার কখনোই অ্যাপ্রুভড হয়নি
         await message.answer("👋 স্বাগতম! এই বটটি ব্যবহার করার জন্য অ্যাডমিনের অ্যাপ্রুভাল প্রয়োজন।\n"
                              "⏳ আপনার রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...",
                              reply_markup=get_contact_admin_keyboard())
@@ -496,7 +432,6 @@ async def send_welcome(message: types.Message, state: FSMContext):
         return
 
     if not is_user_currently_approved(user_id):
-        # কেস ২: ইউজার অ্যাপ্রুভড ছিল, কিন্তু মেয়াদ শেষ (Expired)
         await message.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে।\n"
                              "⏳ আপনার রিনিউ রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...",
                              reply_markup=get_contact_admin_keyboard())
@@ -508,7 +443,6 @@ async def send_welcome(message: types.Message, state: FSMContext):
         except Exception as e: logging.error(f"অ্যাডমিনকে রিনিউ মেসেজ পাঠানো যায়নি: {e}")
         return
 
-    # কেস ৩: ইউজার অ্যাপ্রুভড এবং অ্যাক্সেস আছে
     if str(user_id) in USER_PROXIES:
         await message.answer(f"স্বাগতম, {user_name}! 👋\nঅ্যাকাউন্ট তৈরি করতে নিচের বাটনগুলি ব্যবহার করুন:",
                              reply_markup=get_user_keyboard())
@@ -540,6 +474,7 @@ async def cancel_fsm_handler(query: types.CallbackQuery, state: FSMContext):
 
 @dp.message(F.text == "⚙️ Set/Update Proxy")
 async def handle_set_proxy(message: types.Message, state: FSMContext):
+    # --- *** Middleware এখন এই হ্যান্ডলারটিকে ব্লক করবে যদি অ্যাপ্রুভড না হয় *** ---
     await state.clear() 
     if str(message.from_user.id) in USER_PROXIES:
         await message.answer("✅ আপনার প্রক্সি ইতিমধ্যেই সেভ করা আছে।\n"
@@ -603,8 +538,6 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
 @dp.message(F.text == "🚀 ACCOUNT CREATE")
 @dp.message(F.text == "🚀 ACCOUNT CREATE (Admin)")
 async def show_site_selection(message: types.Message, state: FSMContext):
-    # Middleware ইতিমধ্যেই চেক করেছে যে ইউজার অ্যাপ্রুভড কিনা
-    # এখন শুধু প্রক্সি চেক করা (অ্যাডমিনের জন্য নয়)
     if message.from_user.id != ADMIN_ID:
         if str(message.from_user.id) not in USER_PROXIES:
             await message.answer("❌ আপনি এখনও প্রক্সি সেট করেননি।\n"
@@ -617,7 +550,6 @@ async def show_site_selection(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("select_site:"))
 async def start_creation_process(query: types.CallbackQuery, state: FSMContext):
-    # Middleware ইতিমধ্যেই চেক করেছে যে ইউজার অ্যাপ্রুভড কিনা
     site_key = query.data.split(":")[-1]
     if site_key not in SITE_CONFIGS:
         await query.answer("❌ অবৈধ সাইট।", show_alert=True); return
@@ -714,7 +646,7 @@ async def main():
     """বট চালু করে"""
     await load_data_from_db() # <-- DB থেকে সব ডেটা লোড করা
     
-    # --- *** Middleware টি রেজিস্টার করা *** ---
+    # --- *** Middleware টি এখানে রেজিস্টার করা হয়েছে *** ---
     dp.update.middleware(AccessMiddleware())
     
     try:
