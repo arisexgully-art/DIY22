@@ -5,15 +5,19 @@ import base64
 import random
 import io
 import json
-import os # <-- Render.com-এর জন্য জরুরি
-import threading # <-- Flask চালানোর জন্য জরুরি
+import os 
+import threading
+from datetime import datetime, timedelta # <-- টাইমারের জন্য জরুরি
 
-from flask import Flask # <-- Render.com-কে জাগিয়ে রাখার জন্য
+from flask import Flask 
 
-# --- নতুন: MongoDB লাইব্রেরি ---
 import motor.motor_asyncio
 
 from aiogram import Bot, Dispatcher, types, F
+# --- *** নতুন: Middleware ইম্পোর্ট করা হলো *** ---
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from typing import Callable, Dict, Any, Awaitable
+
 from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.fsm.context import FSMContext
@@ -26,14 +30,13 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
 # --- ধাপ ১: কনফিগারেশন ---
-# --- *** টোকেন এখন Render.com থেকে লোড হবে *** ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 if not BOT_TOKEN:
     logging.critical("!!! BOT_TOKEN এনভায়রনমেন্ট ভেরিয়েবল সেট করা নেই! বট বন্ধ হয়ে যাচ্ছে।")
     exit()
 
 ADMIN_ID = 8308179143
-ADMIN_USERNAME = "Sujay_X" # <-- আপনার ইউজারনেম
+ADMIN_USERNAME = "Sujay_X" 
 
 SECRET_KEY = "djchdnfkxnjhgvuy".encode('utf-8')
 IV = "ayghjuiklobghfrt".encode('utf-8')
@@ -77,13 +80,14 @@ if not MONGO_URI:
 try:
     client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
     db = client["MyBotDatabase"] 
-    approved_collection = db["approved_users"] 
+    approved_collection = db["approved_users"] # <-- এটি এখন ইউজারের সময়ও সেভ করবে
     proxies_collection = db["user_proxies"] 
 except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
 
-APPROVED_USERS = set()
+# --- *** পরিবর্তন: APPROVED_USERS এখন একটি ডিকশনারি *** ---
+APPROVED_USERS = {} # { user_id: expires_at_timestamp }
 USER_PROXIES = {} 
 
 # --- লগিং সেটআপ ---
@@ -97,15 +101,18 @@ def keep_alive():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
-# --- ধাপ ২: ডেটা লোড ফাংশন (DB থেকে) ---
+# --- ধাপ ২: নতুন ডেটা লোড ফাংশন (DB থেকে) ---
 async def load_data_from_db():
     global APPROVED_USERS, USER_PROXIES
     try:
-        cursor = approved_collection.find({}, {"_id": 0, "user_id": 1})
-        APPROVED_USERS = {doc["user_id"] for doc in await cursor.to_list(None)}
-        if ADMIN_ID not in APPROVED_USERS:
-            await approved_collection.insert_one({"user_id": ADMIN_ID})
-            APPROVED_USERS.add(ADMIN_ID)
+        # --- *** পরিবর্তন: এখন 'expires_at' লোড করা হচ্ছে *** ---
+        cursor = approved_collection.find({}, {"_id": 0, "user_id": 1, "expires_at": 1})
+        # ডিফল্ট 0 মানে অ্যাক্সেস নেই
+        APPROVED_USERS = {doc["user_id"]: doc.get("expires_at", 0) for doc in await cursor.to_list(None)}
+        
+        # অ্যাডমিনকে সব সময় পার্মানেন্ট অ্যাক্সেস দেওয়া
+        # (datetime.max.timestamp() একটি বিশাল বড় সংখ্যা যা কখনো এক্সপায়ার হবে না)
+        APPROVED_USERS[ADMIN_ID] = datetime.max.timestamp() 
         
         cursor = proxies_collection.find({})
         for doc in await cursor.to_list(None):
@@ -115,8 +122,61 @@ async def load_data_from_db():
     
     except Exception as e:
         logging.error(f"DB থেকে ডেটা লোড করায় সমস্যা: {e}")
-        APPROVED_USERS = {ADMIN_ID}
+        APPROVED_USERS = {ADMIN_ID: datetime.max.timestamp()}
         USER_PROXIES = {}
+
+# --- *** নতুন: অ্যাক্সেস চেক করার ফাংশন *** ---
+def is_user_currently_approved(user_id: int) -> bool:
+    if user_id not in APPROVED_USERS:
+        return False # ইউজার লিস্টেই নেই
+    
+    expires_at = APPROVED_USERS.get(user_id, 0)
+    
+    # বর্তমান সময়ের থেকে বেশি টাইম থাকলেই শুধু অ্যাপ্রুভড
+    return datetime.now().timestamp() < expires_at
+
+# --- *** নতুন: অ্যাক্সেস কন্ট্রোল Middleware *** ---
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[types.TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: types.Message | types.CallbackQuery,
+        data: Dict[str, Any]
+    ) -> Any:
+        
+        user_id = event.from_user.id
+        
+        # অ্যাডমিনকে সব সময় অ্যালাও করা
+        if user_id == ADMIN_ID:
+            return await handler(event, data)
+            
+        # যে কম্যান্ডগুলি সবার জন্য খোলা থাকা উচিত
+        if isinstance(event, types.Message) and data.get("command") and data["command"].command == "start":
+            return await handler(event, data) # /start হ্যান্ডলারকে নিজে ম্যানেজ করতে দেওয়া
+        if isinstance(event, types.CallbackQuery) and (event.data.startswith("approve:") or event.data == "cancel_fsm"):
+            return await handler(event, data) # অ্যাডমিন বাটন ও ক্যানসেল বাটন
+        
+        # প্রক্সি সেটআপ ফ্লো-কে অ্যালাও করা
+        state: FSMContext = data.get('state')
+        if state:
+            current_state = await state.get_state()
+            if current_state and current_state.startswith("UserData:getting_proxy"):
+                return await handler(event, data)
+
+        # বাকি সবকিছুর জন্য অ্যাক্সেস চেক করা
+        if not is_user_currently_approved(user_id):
+            if user_id in APPROVED_USERS: # এর মানে ইউজারের অ্যাক্সেস ছিল, কিন্তু এক্সপায়ার হয়ে গেছে
+                await event.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে।\n"
+                                   "অ্যাডমিনের সাথে যোগাযোগ করুন বা /start চেপে রিনিউ করুন।", 
+                                   show_alert=True if isinstance(event, types.CallbackQuery) else False)
+            else: # ইউজার কখনোই অ্যাপ্রুভড ছিল না
+                await event.answer("❌ আপনার এই বটটি ব্যবহার করার অনুমতি নেই।\n"
+                                   "অনুগ্রহ করে /start চেপে অ্যাডমিনের অ্যাপ্রুভালের জন্য রিকোয়েস্ট করুন।", 
+                                   show_alert=True if isinstance(event, types.CallbackQuery) else False)
+            return # হ্যান্ডলারটি আর কল করা হবে না
+
+        # ইউজার অ্যাপ্রুভড এবং অ্যাক্সেস আছে
+        return await handler(event, data)
 
 # --- ধাপ ৩: FSM স্টেট ---
 class UserData(StatesGroup):
@@ -127,7 +187,7 @@ class UserData(StatesGroup):
     waiting_for_referral = State()
     waiting_for_amount = State()
 
-# --- ধাপ ৪: কীবোর্ড ---
+# --- ধাপ ৪: কীবোর্ড (***পরিবর্তিত***) ---
 def get_user_keyboard() -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="🚀 ACCOUNT CREATE")],
@@ -140,11 +200,19 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🚀 ACCOUNT CREATE (Admin)")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
 def get_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """নতুন: টাইমার সহ অ্যাপ্রুভাল বাটন"""
     buttons = [
-        [InlineKeyboardButton(text=f"✅ Approve User ({user_id})", callback_data=f"approve:{user_id}")]
+        [
+            InlineKeyboardButton(text="✅ 1H", callback_data=f"approve:{user_id}:3600"),
+            InlineKeyboardButton(text="✅ 6H", callback_data=f"approve:{user_id}:21600"),
+            InlineKeyboardButton(text="✅ 1D", callback_data=f"approve:{user_id}:86400"),
+            InlineKeyboardButton(text="✅ 1W", callback_data=f"approve:{user_id}:604800")
+        ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 def get_stop_keyboard(user_id: int) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="⏹️ Cancel Operation", callback_data=f"stop:{user_id}")]
@@ -163,7 +231,6 @@ def get_site_selection_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Tg377", callback_data="select_site:tg377")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 def get_contact_admin_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="📞 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")]
@@ -352,48 +419,74 @@ async def process_batch_task_admin(user_id: int, amount: int, referral_code: str
 async def list_approved_users(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     await state.clear()
-    text = "👤 **Approved Users List:**\n"; text += " (No users approved yet)" if not APPROVED_USERS else ""
-    for user_id in APPROVED_USERS: text += f"- `{user_id}`" + (" (Admin)\n" if user_id == ADMIN_ID else "\n")
+    text = "👤 **Approved Users List:**\n"; text += " (No users approved yet)" if len(APPROVED_USERS) <= 1 else ""
+    now = datetime.now().timestamp()
+    for user_id, expires_at in APPROVED_USERS.items():
+        if user_id == ADMIN_ID:
+            text += f"- `{user_id}` (Admin, Permanent)\n"
+            continue
+        
+        if expires_at > now:
+            remaining_time = expires_at - now
+            if remaining_time > 86400: # 1 দিনের বেশি
+                status = f"✅ Active ({remaining_time / 86400:.1f} days left)"
+            else:
+                status = f"✅ Active ({remaining_time / 3600:.1f} hours left)"
+        else:
+            status = "❌ Expired"
+        text += f"- `{user_id}` ({status})\n"
     await message.answer(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
 
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
     if query.from_user.id != ADMIN_ID:
         await query.answer("❗️ এটি শুধুমাত্র অ্যাডমিন করতে পারে।", show_alert=True); return
-    try: user_id_to_approve = int(query.data.split(":")[1])
+    try:
+        parts = query.data.split(":")
+        user_id_to_approve = int(parts[1])
+        duration_seconds = int(parts[2])
     except Exception as e:
-        await query.answer("Error parsing user ID.", show_alert=True); logging.error(f"Callback error: {e}"); return
-    if user_id_to_approve in APPROVED_USERS:
-        await query.message.edit_text(f"✅ ইউজার {user_id_to_approve} ইতিমধ্যেই অ্যাপ্রুভড।", reply_markup=None)
-        await query.answer("User was already approved.")
-    else:
-        await approved_collection.insert_one({"user_id": user_id_to_approve})
-        APPROVED_USERS.add(user_id_to_approve) 
-        await query.message.edit_text(f"✅ ইউজার {user_id_to_approve} কে অ্যাপ্রুভ করা হয়েছে।", reply_markup=None)
-        try:
-            await bot.send_message(user_id_to_approve, "🎉 অভিনন্দন! অ্যাডমিন আপনার রিকোয়েস্ট অ্যাপ্রুভ করেছে।\n\n"
-                                   "এই বটটি ব্যবহার করার জন্য প্রথমে আপনার ABC প্রক্সি সেট করতে হবে।\n\n"
-                                   "🔑 দয়া করে **Host** টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
-                                   reply_markup=types.ReplyKeyboardRemove())
-            await dp.storage.set_state(bot=bot, chat=user_id_to_approve, user=user_id_to_approve, state=UserData.getting_proxy_host)
-        except Exception as e: logging.error(f"অ্যাপ্রুভড ইউজারকে মেসেজ পাঠানো যায়নি: {e}")
-        await query.answer("User approved!")
+        await query.answer("Error parsing callback.", show_alert=True); logging.error(f"Callback error: {e}"); return
+
+    # --- নতুন: టైম ক্যালকুলেশন ---
+    expires_at = datetime.now().timestamp() + duration_seconds
+    duration_hours = duration_seconds / 3600
+    
+    # DB এবং লোকাল ক্যাশে আপডেট
+    await approved_collection.update_one(
+        {"user_id": user_id_to_approve},
+        {"$set": {"expires_at": expires_at}},
+        upsert=True
+    )
+    APPROVED_USERS[user_id_to_approve] = expires_at
+    
+    await query.message.edit_text(f"✅ ইউজার {user_id_to_approve} কে {duration_hours:.0f} ঘণ্টার জন্য অ্যাপ্রুভ করা হয়েছে।", reply_markup=None)
+    
+    try:
+        # ইউজারকে জানানো
+        await bot.send_message(user_id_to_approve, 
+                               f"🎉 অভিনন্দন! অ্যাডমিন আপনার অ্যাক্সেস {duration_hours:.0f} ঘণ্টার জন্য অ্যাপ্রুভ/রিনিউ করেছে।\n\n"
+                               "বটটি ব্যবহার করতে /start চাপুন।")
+    except Exception as e: 
+        logging.error(f"অ্যাপ্রুভড ইউজারকে মেসেজ পাঠানো যায়নি: {e}")
+    await query.answer("User approved!")
 
 @dp.message(CommandStart())
 async def send_welcome(message: types.Message, state: FSMContext):
     user_id = message.from_user.id; user_name = message.from_user.full_name
+    await state.clear() 
     
     if user_id == ADMIN_ID:
-        await state.clear() 
         await message.answer(f"👑 স্বাগতম, অ্যাডমিন {user_name}! আপনার জন্য অ্যাডমিন প্যানেল।",
                              reply_markup=get_admin_keyboard())
         return
 
+    # --- *** নতুন: /start-এর সম্পূর্ণ নতুন লজিক *** ---
     if user_id not in APPROVED_USERS:
-        await state.clear() 
+        # কেস ১: ইউজার কখনোই অ্যাপ্রুভড হয়নি
         await message.answer("👋 স্বাগতম! এই বটটি ব্যবহার করার জন্য অ্যাডমিনের অ্যাপ্রুভাল প্রয়োজন।\n"
                              "⏳ আপনার রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...",
-                             reply_markup=get_contact_admin_keyboard()) # <-- কন্টাক্ট বাটন সহ
+                             reply_markup=get_contact_admin_keyboard())
         try:
             await bot.send_message(ADMIN_ID, f"❗️ **New User Request** ❗️\n\n"
                                    f"**Name:** {user_name}\n**User ID:** `{user_id}`\n\n"
@@ -402,8 +495,21 @@ async def send_welcome(message: types.Message, state: FSMContext):
         except Exception as e: logging.error(f"অ্যাডমিনকে অ্যাপ্রুভাল মেসেজ পাঠানো যায়নি: {e}")
         return
 
+    if not is_user_currently_approved(user_id):
+        # কেস ২: ইউজার অ্যাপ্রুভড ছিল, কিন্তু মেয়াদ শেষ (Expired)
+        await message.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে।\n"
+                             "⏳ আপনার রিনিউ রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...",
+                             reply_markup=get_contact_admin_keyboard())
+        try:
+            await bot.send_message(ADMIN_ID, f"❗️ **User Renewal Request** ❗️\n\n"
+                                   f"**Name:** {user_name}\n**User ID:** `{user_id}`\n\n"
+                                   f"এই ইউজারের অ্যাক্সেস শেষ হয়ে গেছে এবং সে রিনিউ করতে চায়।",
+                                   parse_mode="Markdown", reply_markup=get_approval_keyboard(user_id))
+        except Exception as e: logging.error(f"অ্যাডমিনকে রিনিউ মেসেজ পাঠানো যায়নি: {e}")
+        return
+
+    # কেস ৩: ইউজার অ্যাপ্রুভড এবং অ্যাক্সেস আছে
     if str(user_id) in USER_PROXIES:
-        await state.clear()
         await message.answer(f"স্বাগতম, {user_name}! 👋\nঅ্যাকাউন্ট তৈরি করতে নিচের বাটনগুলি ব্যবহার করুন:",
                              reply_markup=get_user_keyboard())
     else:
@@ -497,20 +603,21 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
 @dp.message(F.text == "🚀 ACCOUNT CREATE")
 @dp.message(F.text == "🚀 ACCOUNT CREATE (Admin)")
 async def show_site_selection(message: types.Message, state: FSMContext):
-    if message.from_user.id == ADMIN_ID:
-        await message.answer("আপনি কোন সাইটের জন্য অ্যাকাউন্ট তৈরি করতে চান?",
-                             reply_markup=get_site_selection_keyboard())
-        return
-    if str(message.from_user.id) not in USER_PROXIES:
-        await message.answer("❌ আপনি এখনও প্রক্সি সেট করেননি।\n"
-                             "দয়া করে প্রথমে '⚙️ Set/Update Proxy' বাটন চেপে আপনার প্রক্সি সেট করুন।",
-                             reply_markup=get_user_keyboard())
-        return
+    # Middleware ইতিমধ্যেই চেক করেছে যে ইউজার অ্যাপ্রুভড কিনা
+    # এখন শুধু প্রক্সি চেক করা (অ্যাডমিনের জন্য নয়)
+    if message.from_user.id != ADMIN_ID:
+        if str(message.from_user.id) not in USER_PROXIES:
+            await message.answer("❌ আপনি এখনও প্রক্সি সেট করেননি।\n"
+                                 "দয়া করে প্রথমে '⚙️ Set/Update Proxy' বাটন চেপে আপনার প্রক্সি সেট করুন।",
+                                 reply_markup=get_user_keyboard())
+            return
+            
     await message.answer("আপনি কোন সাইটের জন্য অ্যাকাউন্ট তৈরি করতে চান?",
                          reply_markup=get_site_selection_keyboard())
 
 @dp.callback_query(F.data.startswith("select_site:"))
 async def start_creation_process(query: types.CallbackQuery, state: FSMContext):
+    # Middleware ইতিমধ্যেই চেক করেছে যে ইউজার অ্যাপ্রুভড কিনা
     site_key = query.data.split(":")[-1]
     if site_key not in SITE_CONFIGS:
         await query.answer("❌ অবৈধ সাইট।", show_alert=True); return
@@ -523,7 +630,6 @@ async def start_creation_process(query: types.CallbackQuery, state: FSMContext):
 
     await state.update_data(selected_site=site_key)
     
-    # --- *** কীবোর্ড ফিক্স: এখন আর ReplyKeyboardRemove() নেই *** ---
     handler_msg = await query.message.answer(
         f"🔑 ({SITE_CONFIGS[site_key]['name']}) দয়া করে আপনার রেফার কোডটি টাইপ করুন:", 
         reply_markup=get_fsm_cancel_keyboard()
@@ -607,6 +713,9 @@ async def process_amount_and_queue(message: types.Message, state: FSMContext):
 async def main():
     """বট চালু করে"""
     await load_data_from_db() # <-- DB থেকে সব ডেটা লোড করা
+    
+    # --- *** Middleware টি রেজিস্টার করা *** ---
+    dp.update.middleware(AccessMiddleware())
     
     try:
         await bot.send_message(ADMIN_ID, f"✅ বট রিস্টার্ট/চালু হয়েছে! ({len(APPROVED_USERS)} জন ইউজার অ্যাপ্রুভড, {len(USER_PROXIES)} টি প্রক্সি লোডেড)")
