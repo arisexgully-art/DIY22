@@ -7,7 +7,7 @@ import io
 import json
 import os 
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta # <-- *** এই লাইনটি যোগ করা হয়েছে ***
 
 from flask import Flask 
 
@@ -20,7 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.client.default import DefaultBotProperties
+from aiogram.client.default import DefaultBotProperties # <-- aiogram 3.7+ এর জন্য
 
 # --- এনক্রিপশন লাইব্রেরি ---
 from Crypto.Cipher import AES
@@ -61,9 +61,11 @@ except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
 
+# --- *** এই ভেরিয়েবলগুলি এখন গ্লোবাল *** ---
 USER_DATA = {} 
 SITE_CONFIGS = {}
 BOT_CONFIG = {} 
+USER_PROXIES = {} # <-- *** এই লাইনটি যোগ করা হয়েছে ***
 
 # --- লগিং সেটআপ ---
 logging.basicConfig(level=logging.INFO)
@@ -78,12 +80,24 @@ def run_flask():
 
 # --- ধাপ ২: নতুন ডেটা লোড ফাংশন (DB থেকে) ---
 async def load_data_from_db():
-    global USER_DATA, SITE_CONFIGS, BOT_CONFIG
+    # --- *** গ্লোবাল ভেরিয়েবলগুলি ডিক্লেয়ার করা হলো *** ---
+    global USER_DATA, SITE_CONFIGS, BOT_CONFIG, USER_PROXIES
     try:
+        # --- ইউজার ডেটা লোড করা (Approve/Ban/Role/Expires) ---
         cursor = users_collection.find({})
         async for doc in cursor:
             USER_DATA[doc["user_id"]] = doc
         
+        # --- প্রক্সি ডেটা লোড করা এবং USER_DATA-তে মার্জ করা ---
+        cursor_proxy = proxies_collection.find({})
+        async for doc in await cursor_proxy.to_list(None):
+            user_id = doc["user_id"]
+            if user_id not in USER_DATA:
+                USER_DATA[user_id] = {"user_id": user_id, "role": "user", "expires_at": 0, "banned": False}
+            USER_DATA[user_id]["proxy"] = doc["proxy_data"]
+            USER_PROXIES[str(user_id)] = doc["proxy_data"] # <-- *** USER_PROXIES পপুলেট করা ***
+
+        # অ্যাডমিনকে পার্মানেন্ট অ্যাক্সেস দেওয়া
         if ADMIN_ID not in USER_DATA:
             admin_data = {
                 "user_id": ADMIN_ID,
@@ -94,12 +108,16 @@ async def load_data_from_db():
             }
             await users_collection.insert_one(admin_data)
             USER_DATA[ADMIN_ID] = admin_data
+        else:
+            USER_DATA[ADMIN_ID]["role"] = "admin"
+            USER_DATA[ADMIN_ID]["expires_at"] = datetime.max.timestamp()
         
+        # --- সাইট কনফিগ লোড করা ---
         cursor = sites_collection.find({})
         async for doc in cursor:
             SITE_CONFIGS[doc["site_key"]] = doc
         
-        if not SITE_CONFIGS:
+        if not SITE_CONFIGS: # যদি কোনো সাইট না থাকে, ডিফল্টগুলি অ্যাড করা (শুধু প্রথমবার)
             default_sites = {
                 "diy22": {"name": "Diy22", "api_endpoint": "https://diy22.club/api/user/signUp", "api_host": "diy22.club", "origin": "https://diy22.com", "referer": "https://diy22.com/", "reg_host": "diy22.com"},
                 "job777": {"name": "Job77", "api_endpoint": "https://job777.club/api/user/signUp", "api_host": "job777.club", "origin": "https://job777.com", "referer": "https://job777.com/", "reg_host": "job777.com"},
@@ -112,6 +130,7 @@ async def load_data_from_db():
                 await sites_collection.insert_one(config_with_key)
                 SITE_CONFIGS[key] = config_with_key
         
+        # --- বট কনফিগ লোড করা (গ্রুপ আইডি) ---
         bot_conf = await config_collection.find_one({"_id": "main_config"})
         if not bot_conf:
             BOT_CONFIG = {"group_id": None, "group_link": None}
@@ -127,20 +146,26 @@ async def load_data_from_db():
         SITE_CONFIGS = {}
         BOT_CONFIG = {"group_id": None, "group_link": None}
 
+
 # --- অ্যাক্সেস চেক করার ফাংশন ---
 def get_user_status(user_id: int) -> dict:
+    """ইউজারের স্ট্যাটাস (রোল, মেয়াদ, ব্যান) চেক করে"""
     user_doc = USER_DATA.get(user_id)
+    
     if not user_doc:
-        return {"status": "new"}
+        return {"status": "new"} # নতুন ইউজার
+        
     if user_doc.get("banned", False):
-        return {"status": "banned"}
+        return {"status": "banned"} # ব্যানড
+        
     if user_doc.get("role") == "admin":
-        return {"status": "active", "role": "admin"}
+        return {"status": "active", "role": "admin"} # অ্যাডমিন
+        
     expires_at = user_doc.get("expires_at", 0)
     if datetime.now().timestamp() < expires_at:
-        return {"status": "active", "role": "user"}
+        return {"status": "active", "role": "user"} # অ্যাক্টিভ ইউজার (সাব-অ্যাডমিন রোল বাদ)
     else:
-        return {"status": "expired"}
+        return {"status": "expired"} # মেয়াদ শেষ
 
 # --- ধাপ ৩: FSM স্টেট ---
 class UserData(StatesGroup):
@@ -148,8 +173,11 @@ class UserData(StatesGroup):
     getting_proxy_port = State()
     getting_proxy_user = State()
     getting_proxy_pass = State()
+    
     waiting_for_referral = State()
     waiting_for_amount = State()
+
+    # --- অ্যাডমিন FSM ---
     adding_site_key = State()
     adding_site_name = State()
     adding_site_endpoint = State()
@@ -157,9 +185,12 @@ class UserData(StatesGroup):
     adding_site_origin = State()
     adding_site_referer = State()
     adding_site_reghost = State()
+    
     removing_site_key = State()
+    
     banning_user_id = State()
     unbanning_user_id = State()
+    
     setting_group_id = State()
     setting_group_link = State()
 
@@ -172,6 +203,7 @@ def get_user_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, input_field_placeholder="Select an option...")
 
 def get_admin_keyboard() -> ReplyKeyboardMarkup:
+    """অ্যাডমিনের কীবোর্ড (সাব-অ্যাডমিন বাটন সরানো হয়েছে)"""
     buttons = [
         [KeyboardButton(text="🚀 ACCOUNT CREATE (Admin)")],
         [KeyboardButton(text="📊 User List")],
@@ -181,6 +213,7 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
     
 def get_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """নতুন: ৩০ মিনিট বাটন যোগ করা হয়েছে"""
     buttons = [
         [
             InlineKeyboardButton(text="✅ 30m", callback_data=f"approve:{user_id}:1800"),
@@ -423,7 +456,7 @@ async def list_approved_users(message: types.Message, state: FSMContext):
             status = "🚫 Banned"
         elif user_id == ADMIN_ID:
             status = "👑 Admin (Permanent)"
-        elif role == "sub-admin": # <-- লেগাসি চেক
+        elif role == "sub-admin": 
             status = "🛡️ Sub-Admin (Legacy)"
         elif expires_at > now:
             remaining_time = expires_at - now
@@ -516,7 +549,7 @@ async def send_welcome(message: types.Message, state: FSMContext):
         except Exception as e:
             logging.error(f"গ্রুপ মেম্বার চেক করায় সমস্যা: {e}")
 
-    # --- *** আপনার রিকোয়েস্ট অনুযায়ী নতুন প্রাইস লিস্ট টেক্সট *** ---
+    # --- প্রাইস লিস্ট টেক্সট ---
     PRICE_LIST_TEXT = (
         "\n\n💎 <b>Unlimited Account Create Bot — Access Price</b>\n\n"
         "⏱ 30 Minute — 20 টাকা\n"
@@ -531,7 +564,6 @@ async def send_welcome(message: types.Message, state: FSMContext):
         await message.answer(f"{msg_text}\n⏳ আপনার রিকোয়েস্ট অ্যাডমিন প্যানেলে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...{PRICE_LIST_TEXT}",
                              reply_markup=get_contact_admin_keyboard())
         
-        # --- নোটিফিকেশন শুধু অ্যাডমিনকে পাঠানো ---
         try:
             request_type = "New User Request" if status == "new" else "User Renewal Request"
             await bot.send_message(ADMIN_ID, f"❗️ <b>{request_type}</b> ❗️\n\n"
@@ -543,7 +575,7 @@ async def send_welcome(message: types.Message, state: FSMContext):
         return
 
     # কেস: ইউজার অ্যাক্টিভ কিন্তু প্রক্সি সেট করা নেই
-    if str(user_id) not in USER_PROXIES:
+    if not USER_DATA.get(user_id, {}).get("proxy"):
         await message.answer(f"👋 স্বাগতম, {user_name}!\n\n"
                              "এই বটটি ব্যবহার করার জন্য প্রথমে আপনার ABC প্রক্সি সেট করতে হবে।\n\n"
                              "🔑 দয়া করে আপনার <b>Host</b> টি লিখুন:\n"
@@ -604,7 +636,7 @@ async def handle_set_proxy(message: types.Message, state: FSMContext):
     if not is_user_currently_approved(message.from_user.id):
         await message.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে। /start চাপুন।"); return
     await state.clear() 
-    if str(message.from_user.id) in USER_PROXIES:
+    if USER_DATA.get(message.from_user.id, {}).get("proxy"):
         await message.answer("✅ আপনার প্রক্সি ইতিমধ্যেই সেভ করা আছে।\n"
                              "যদি এটি পরিবর্তন করতে চান, '🔄 Change Proxy' বাটনে ক্লিক করুন।",
                              reply_markup=get_user_keyboard())
@@ -651,11 +683,12 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
         "user": user_data['proxy_user'],
         "pass": message.text 
     }
-    user_id_str = str(message.from_user.id)
-    USER_PROXIES[user_id_str] = proxy_info
+    user_id = message.from_user.id
+    
+    USER_DATA.setdefault(user_id, {})["proxy"] = proxy_info
     
     await proxies_collection.update_one(
-        {"user_id": int(user_id_str)},
+        {"user_id": user_id},
         {"$set": {"proxy_data": proxy_info}},
         upsert=True
     )
@@ -761,10 +794,10 @@ async def process_amount_and_queue(message: types.Message, state: FSMContext):
             )
         else:
             try:
-                proxy_data = USER_PROXIES[str(message.from_user.id)]
+                proxy_data = USER_DATA[message.from_user.id]["proxy"]
                 proxy_host = proxy_data['host']; proxy_port = proxy_data['port']
                 proxy_user = proxy_data['user']; proxy_pass = proxy_data['pass']
-            except KeyError:
+            except (KeyError, TypeError):
                  await bot.edit_message_text("❌ আপনার প্রক্সি সেভ করা নেই। দয়া করে 'Set/Update Proxy' দিয়ে আবার সেট করুন।", chat_id=message.chat.id, message_id=handler_msg_id)
                  await state.clear(); await message.delete(); return
             
@@ -784,7 +817,6 @@ async def process_amount_and_queue(message: types.Message, state: FSMContext):
 
 
 # --- অ্যাডমিন ম্যানেজমেন্ট হ্যান্ডলারগুলি ---
-# --- সাইট ম্যানেজমেন্ট ---
 @dp.message(F.text == "🌐 Site Mgt")
 async def handle_site_mgt(message: types.Message, state: FSMContext):
     if USER_DATA.get(message.from_user.id, {}).get("role") != "admin": return
