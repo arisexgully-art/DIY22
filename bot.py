@@ -7,7 +7,7 @@ import io
 import json
 import os 
 import threading
-from datetime import datetime, timedelta # <-- টাইমারের জন্য জরুরি
+from datetime import datetime, timedelta
 
 from flask import Flask 
 
@@ -20,7 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.client.default import DefaultBotProperties # <-- aiogram 3.7+ এর জন্য
+from aiogram.client.default import DefaultBotProperties
 
 # --- এনক্রিপশন লাইব্রেরি ---
 from Crypto.Cipher import AES
@@ -37,29 +37,6 @@ ADMIN_USERNAME = "Sujay_X"
 
 SECRET_KEY = "djchdnfkxnjhgvuy".encode('utf-8')
 IV = "ayghjuiklobghfrt".encode('utf-8')
-
-SITE_CONFIGS = {
-    "diy22": {
-        "name": "Diy22", "api_endpoint": "https://diy22.club/api/user/signUp",
-        "api_host": "diy22.club", "origin": "https://diy22.com",
-        "referer": "https://diy22.com/", "reg_host": "diy22.com"
-    },
-    "job777": {
-        "name": "Job77", "api_endpoint": "https://job777.club/api/user/signUp",
-        "api_host": "job777.club", "origin": "https://job777.com",
-        "referer": "https://job777.com/", "reg_host": "job777.com"
-    },
-    "sms323": {
-        "name": "Sms323", "api_endpoint": "https://sms323.club/api/user/signUp",
-        "api_host": "sms323.club", "origin": "https://sms323.com",
-        "referer": "https://sms323.com/", "reg_host": "sms323.com"
-    },
-    "tg377": {
-        "name": "Tg377", "api_endpoint": "https://tg377.club/api/user/signUp",
-        "api_host": "tg377.club", "origin": "https://tg377.vip",
-        "referer": "https://tg377.vip/", "reg_host": "tg377.vip"
-    }
-}
 
 # --- গ্লোবাল ভেরিয়েবল ---
 storage = MemoryStorage()
@@ -84,7 +61,6 @@ except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
 
-# --- *** এই ভেরিয়েবলগুলি এখন গ্লোবাল *** ---
 USER_DATA = {} 
 SITE_CONFIGS = {}
 BOT_CONFIG = {} 
@@ -102,10 +78,8 @@ def run_flask():
 
 # --- ধাপ ২: নতুন ডেটা লোড ফাংশন (DB থেকে) ---
 async def load_data_from_db():
-    # --- *** গ্লোবাল ভেরিয়েবলগুলি ডিক্লেয়ার করা হলো *** ---
     global USER_DATA, SITE_CONFIGS, BOT_CONFIG
     try:
-        # --- ইউজার ডেটা লোড করা ---
         cursor = users_collection.find({})
         async for doc in cursor:
             USER_DATA[doc["user_id"]] = doc
@@ -121,7 +95,6 @@ async def load_data_from_db():
             await users_collection.insert_one(admin_data)
             USER_DATA[ADMIN_ID] = admin_data
         
-        # --- সাইট কনফিগ লোড করা ---
         cursor = sites_collection.find({})
         async for doc in cursor:
             SITE_CONFIGS[doc["site_key"]] = doc
@@ -139,7 +112,6 @@ async def load_data_from_db():
                 await sites_collection.insert_one(config_with_key)
                 SITE_CONFIGS[key] = config_with_key
         
-        # --- বট কনফিগ লোড করা (গ্রুপ আইডি) ---
         bot_conf = await config_collection.find_one({"_id": "main_config"})
         if not bot_conf:
             BOT_CONFIG = {"group_id": None, "group_link": None}
@@ -155,27 +127,20 @@ async def load_data_from_db():
         SITE_CONFIGS = {}
         BOT_CONFIG = {"group_id": None, "group_link": None}
 
-
 # --- অ্যাক্সেস চেক করার ফাংশন ---
 def get_user_status(user_id: int) -> dict:
-    """ইউজারের স্ট্যাটাস (রোল, মেয়াদ, ব্যান) চেক করে"""
     user_doc = USER_DATA.get(user_id)
-    
     if not user_doc:
-        return {"status": "new"} # নতুন ইউজার
-        
+        return {"status": "new"}
     if user_doc.get("banned", False):
-        return {"status": "banned"} # ব্যানড
-        
+        return {"status": "banned"}
     if user_doc.get("role") == "admin":
-        return {"status": "active", "role": "admin"} # অ্যাডমিন
-        
+        return {"status": "active", "role": "admin"}
     expires_at = user_doc.get("expires_at", 0)
     if datetime.now().timestamp() < expires_at:
-        role = user_doc.get("role", "user")
-        return {"status": "active", "role": role} # অ্যাক্টিভ (সাব-অ্যাডমিন বা ইউজার)
+        return {"status": "active", "role": "user"}
     else:
-        return {"status": "expired"} # মেয়াদ শেষ
+        return {"status": "expired"}
 
 # --- ধাপ ৩: FSM স্টেট ---
 class UserData(StatesGroup):
@@ -193,8 +158,6 @@ class UserData(StatesGroup):
     adding_site_referer = State()
     adding_site_reghost = State()
     removing_site_key = State()
-    adding_sub_admin_id = State()
-    removing_sub_admin_id = State()
     banning_user_id = State()
     unbanning_user_id = State()
     setting_group_id = State()
@@ -212,14 +175,8 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="🚀 ACCOUNT CREATE (Admin)")],
         [KeyboardButton(text="📊 User List")],
-        [KeyboardButton(text="🛡️ Sub-Admin Mgt"), KeyboardButton(text="🚫 User Ban Mgt")],
+        [KeyboardButton(text="🚫 User Ban Mgt")],
         [KeyboardButton(text="🌐 Site Mgt"), KeyboardButton(text="🔗 Group Mgt")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
-def get_sub_admin_keyboard() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton(text="📊 List Approved Users")], # এটি User List-এই কল করবে
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
     
@@ -447,9 +404,7 @@ async def process_batch_task_admin(user_id: int, amount: int, referral_code: str
 
 @dp.message(F.text == "📊 User List")
 async def list_approved_users(message: types.Message, state: FSMContext):
-    user_role = USER_DATA.get(message.from_user.id, {}).get("role")
-    if user_role not in ["admin", "sub-admin"]: return
-    
+    if get_user_status(message.from_user.id).get("role") != "admin": return
     await state.clear()
     text_lines = ["👤 <b>User Access List:</b>\n"]
     if len(USER_DATA) <= 1: 
@@ -468,8 +423,8 @@ async def list_approved_users(message: types.Message, state: FSMContext):
             status = "🚫 Banned"
         elif user_id == ADMIN_ID:
             status = "👑 Admin (Permanent)"
-        elif role == "sub-admin":
-            status = "🛡️ Sub-Admin"
+        elif role == "sub-admin": # <-- লেগাসি চেক
+            status = "🛡️ Sub-Admin (Legacy)"
         elif expires_at > now:
             remaining_time = expires_at - now
             if remaining_time > 86400: status = f"✅ Active ({remaining_time / 86400:.1f} days left)"
@@ -479,13 +434,12 @@ async def list_approved_users(message: types.Message, state: FSMContext):
             
         text_lines.append(f"- <code>{user_id}</code> ({status})")
 
-    await message.answer("\n".join(text_lines), reply_markup=get_admin_keyboard() if USER_DATA.get(message.from_user.id, {}).get("role") == "admin" else get_sub_admin_keyboard())
+    await message.answer("\n".join(text_lines), reply_markup=get_admin_keyboard())
 
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
-    user_role = USER_DATA.get(query.from_user.id, {}).get("role")
-    if user_role not in ["admin", "sub-admin"]:
-        await query.answer("❗️ এটি শুধুমাত্র অ্যাডমিন বা সাব-অ্যাডমিন করতে পারে।", show_alert=True); return
+    if get_user_status(query.from_user.id).get("role") != "admin":
+        await query.answer("❗️ এটি শুধুমাত্র অ্যাডমিন করতে পারে।", show_alert=True); return
         
     try:
         parts = query.data.split(":")
@@ -524,7 +478,7 @@ async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
     
     try:
         await bot.send_message(user_id_to_approve, 
-                               f"🎉 অভিনন্দন! আপনার অ্যাক্সেস {duration_text}-এর জন্য অ্যাপ্রুভ/রিনিউ করা হয়েছে।\n\n"
+                               f"🎉 অভিনন্দন! অ্যাডমিন আপনার অ্যাক্সেস {duration_text}-এর জন্য অ্যাপ্রুভ/রিনিউ করেছে।\n\n"
                                "বটটি ব্যবহার করতে /start চাপুন।")
     except Exception as e: 
         logging.error(f"অ্যাপ্রুভড ইউজারকে মেসেজ পাঠানো যায়নি: {e}")
@@ -548,11 +502,7 @@ async def send_welcome(message: types.Message, state: FSMContext):
                              reply_markup=get_admin_keyboard())
         return
 
-    if status == "active" and status_info.get("role") == "sub-admin":
-        await message.answer(f"🛡️ স্বাগতম, সাব-অ্যাডমিন {user_name}! আপনার জন্য সাব-অ্যাডমিন প্যানেল।",
-                             reply_markup=get_sub_admin_keyboard())
-        return
-
+    # --- গ্রুপ জয়েন চেক ---
     group_id = BOT_CONFIG.get("group_id")
     if group_id:
         try:
@@ -566,34 +516,43 @@ async def send_welcome(message: types.Message, state: FSMContext):
         except Exception as e:
             logging.error(f"গ্রুপ মেম্বার চেক করায় সমস্যা: {e}")
 
+    # --- *** আপনার রিকোয়েস্ট অনুযায়ী নতুন প্রাইস লিস্ট টেক্সট *** ---
+    PRICE_LIST_TEXT = (
+        "\n\n💎 <b>Unlimited Account Create Bot — Access Price</b>\n\n"
+        "⏱ 30 Minute — 20 টাকা\n"
+        "⏱ 1 Hour — 40 টাকা\n"
+        "⏱ 6 Hours — 150 টাকা\n"
+        "⏱ 1 Day — 300 টাকা\n"
+        "⏱ 1 Week — 600 টাকা"
+    )
+
     if status == "new" or status == "expired":
         msg_text = "👋 স্বাগতম!" if status == "new" else "❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে।"
-        await message.answer(f"{msg_text}\n⏳ আপনার রিকোয়েস্ট অ্যাডমিন প্যানেলে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...",
+        await message.answer(f"{msg_text}\n⏳ আপনার রিকোয়েস্ট অ্যাডমিন প্যানেলে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...{PRICE_LIST_TEXT}",
                              reply_markup=get_contact_admin_keyboard())
         
-        admin_list = [uid for uid, data in USER_DATA.items() if data.get("role") in ["admin", "sub-admin"]]
-        request_type = "New User Request" if status == "new" else "User Renewal Request"
-        
-        for admin_id in admin_list:
-            if admin_id == user_id: continue
-            try:
-                await bot.send_message(admin_id, f"❗️ **{request_type}** ❗️\n\n"
-                                       f"**Name:** {message.from_user.full_name}\n**User ID:** <code>{user_id}</code>\n\n"
-                                       f"এই ইউজার বটটি ব্যবহার করতে চায়। আপনি কি অ্যাপ্রুভ করবেন?",
-                                       reply_markup=get_approval_keyboard(user_id))
-            except Exception as e: 
-                logging.error(f"অ্যাডমিন/সাব-অ্যাডমিন {admin_id} কে নোটিফিকেশন পাঠানো যায়নি: {e}")
+        # --- নোটিফিকেশন শুধু অ্যাডমিনকে পাঠানো ---
+        try:
+            request_type = "New User Request" if status == "new" else "User Renewal Request"
+            await bot.send_message(ADMIN_ID, f"❗️ <b>{request_type}</b> ❗️\n\n"
+                                   f"<b>Name:</b> {message.from_user.full_name}\n<b>User ID:</b> <code>{user_id}</code>\n\n"
+                                   f"এই ইউজার বটটি ব্যবহার করতে চায়। আপনি কি অ্যাপ্রুভ করবেন?",
+                                   reply_markup=get_approval_keyboard(user_id))
+        except Exception as e: 
+            logging.error(f"অ্যাডমিন {ADMIN_ID} কে নোটিফিকেশন পাঠানো যায়নি: {e}")
         return
 
+    # কেস: ইউজার অ্যাক্টিভ কিন্তু প্রক্সি সেট করা নেই
     if str(user_id) not in USER_PROXIES:
         await message.answer(f"👋 স্বাগতম, {user_name}!\n\n"
                              "এই বটটি ব্যবহার করার জন্য প্রথমে আপনার ABC প্রক্সি সেট করতে হবে।\n\n"
-                             "🔑 দয়া করে আপনার **Host** টি লিখুন:\n"
+                             "🔑 দয়া করে আপনার <b>Host</b> টি লিখুন:\n"
                              "(e.g., as.d3230a9b316c9763.abcproxy.vip)",
                              reply_markup=types.ReplyKeyboardRemove())
         await state.set_state(UserData.getting_proxy_host)
         return
 
+    # কেস: ইউজার অ্যাক্টিভ এবং প্রক্সি সেট করা আছে
     await message.answer(f"স্বাগতম, {user_name}! 👋\nঅ্যাকাউন্ট তৈরি করতে নিচের বাটনগুলি ব্যবহার করুন:",
                          reply_markup=get_user_keyboard())
 
@@ -614,7 +573,7 @@ async def verify_join_handler(query: types.CallbackQuery, state: FSMContext):
     
     await query.message.delete()
     await query.answer("✅ ভেরিফিকেশন সফল!")
-    await send_welcome(query.message, state)
+    await send_welcome(query.message, state) # <-- /start ফ্লো আবার চালানো
 
 
 @dp.callback_query(F.data.startswith("stop:"))
@@ -651,7 +610,7 @@ async def handle_set_proxy(message: types.Message, state: FSMContext):
                              reply_markup=get_user_keyboard())
         return
     await message.answer("🔑 আপনার ABC প্রক্সি সেটআপ শুরু করছি।\n\n"
-                         "দয়া করে **Host** টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
+                         "দয়া করে <b>Host</b> টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
                          reply_markup=types.ReplyKeyboardRemove()); await state.set_state(UserData.getting_proxy_host)
 
 @dp.message(F.text == "🔄 Change Proxy")
@@ -660,7 +619,7 @@ async def handle_change_proxy(message: types.Message, state: FSMContext):
         await message.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে। /start চাপুন।"); return
     await state.clear() 
     await message.answer("🔑 আপনার নতুন ABC প্রক্সি সেটআপ শুরু করছি।\n\n"
-                         "দয়া করে **Host** টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
+                         "দয়া করে <b>Host</b> টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
                          reply_markup=types.ReplyKeyboardRemove()); await state.set_state(UserData.getting_proxy_host)
 
 @dp.message(UserData.getting_proxy_host)
@@ -694,6 +653,7 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
     }
     user_id_str = str(message.from_user.id)
     USER_PROXIES[user_id_str] = proxy_info
+    
     await proxies_collection.update_one(
         {"user_id": int(user_id_str)},
         {"$set": {"proxy_data": proxy_info}},
@@ -824,7 +784,6 @@ async def process_amount_and_queue(message: types.Message, state: FSMContext):
 
 
 # --- অ্যাডমিন ম্যানেজমেন্ট হ্যান্ডলারগুলি ---
-
 # --- সাইট ম্যানেজমেন্ট ---
 @dp.message(F.text == "🌐 Site Mgt")
 async def handle_site_mgt(message: types.Message, state: FSMContext):
@@ -934,79 +893,11 @@ async def remove_site_finish(message: types.Message, state: FSMContext):
     await message.answer(f"✅ সাইট (key: <code>{site_key}</code>) সফলভাবে ডিলিট করা হয়েছে।", reply_markup=get_admin_keyboard())
     await state.clear()
 
-# --- সাব-অ্যাডমিন ম্যানেজমেন্ট ---
+# --- সাব-অ্যাডমিন ম্যানেজমেন্ট (সরানো হয়েছে) ---
 @dp.message(F.text == "🛡️ Sub-Admin Mgt")
 async def handle_sub_admin_mgt(message: types.Message, state: FSMContext):
     if USER_DATA.get(message.from_user.id, {}).get("role") != "admin": return
-    await state.clear()
-    
-    text = "🛡️ <b>Sub-Admin List:</b>\n"
-    sub_admins = [uid for uid, data in USER_DATA.items() if data.get("role") == "sub-admin"]
-    
-    if not sub_admins:
-        text += "(খালি)"
-    else:
-        for user_id in sub_admins:
-            text += f"- <code>{user_id}</code>\n"
-            
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Add Sub-Admin", callback_data="add_sub_admin")],
-        [InlineKeyboardButton(text="➖ Remove Sub-Admin", callback_data="remove_sub_admin")]
-    ]))
-
-@dp.callback_query(F.data == "add_sub_admin")
-async def add_sub_admin_start(query: types.CallbackQuery, state: FSMContext):
-    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
-    await query.message.answer("অনুগ্রহ করে নতুন সাব-অ্যাডমিনের <b>User ID</b> টাইপ করুন:",
-                               reply_markup=get_fsm_cancel_keyboard())
-    await state.set_state(UserData.adding_sub_admin_id)
-    await query.answer()
-
-@dp.message(UserData.adding_sub_admin_id)
-async def add_sub_admin_finish(message: types.Message, state: FSMContext):
-    try:
-        user_id = int(message.text)
-    except ValueError:
-        await message.answer("❌ User ID অবশ্যই একটি সংখ্যা হতে হবে।", reply_markup=get_fsm_cancel_keyboard()); return
-
-    user_data = USER_DATA.get(user_id, {"user_id": user_id, "banned": False, "proxy": None})
-    user_data["role"] = "sub-admin"
-    user_data["expires_at"] = datetime.max.timestamp() # সাব-অ্যাডমিনের পার্মানেন্ট অ্যাক্সেস
-    
-    await users_collection.update_one({"user_id": user_id}, {"$set": user_data}, upsert=True)
-    USER_DATA[user_id] = user_data
-    
-    await message.answer(f"✅ ইউজার <code>{user_id}</code>-কে সফলভাবে সাব-অ্যাডমিন বানানো হয়েছে।", reply_markup=get_admin_keyboard())
-    await state.clear()
-
-@dp.callback_query(F.data == "remove_sub_admin")
-async def remove_sub_admin_start(query: types.CallbackQuery, state: FSMContext):
-    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
-    await query.message.answer("অনুগ্রহ করে যে সাব-অ্যাডমিনকে সরাতে চান তার <b>User ID</b> টাইপ করুন:",
-                               reply_markup=get_fsm_cancel_keyboard())
-    await state.set_state(UserData.removing_sub_admin_id)
-    await query.answer()
-
-@dp.message(UserData.removing_sub_admin_id)
-async def remove_sub_admin_finish(message: types.Message, state: FSMContext):
-    try:
-        user_id = int(message.text)
-    except ValueError:
-        await message.answer("❌ User ID অবশ্যই একটি সংখ্যা হতে হবে।", reply_markup=get_fsm_cancel_keyboard()); return
-
-    if USER_DATA.get(user_id, {}).get("role") != "sub-admin":
-        await message.answer("❌ এই ইউজারটি সাব-অ্যাডমিন নয়।", reply_markup=get_admin_keyboard())
-        await state.clear(); return
-        
-    USER_DATA[user_id]["role"] = "user"
-    USER_DATA[user_id]["expires_at"] = 0 
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"role": "user", "expires_at": 0}}
-    )
-    
-    await message.answer(f"✅ সাব-অ্যাডমিন <code>{user_id}</code>-কে সফলভাবে সরিয়ে সাধারণ ইউজার বানানো হয়েছে।", reply_markup=get_admin_keyboard())
-    await state.clear()
+    await message.answer("এই ফিচারটি বর্তমানে বন্ধ আছে।", reply_markup=get_admin_keyboard())
 
 # --- ইউজার ব্যান ম্যানেজমেন্ট ---
 @dp.message(F.text == "🚫 User Ban Mgt")
@@ -1135,9 +1026,8 @@ async def main():
     """বট চালু করে"""
     await load_data_from_db() # <-- DB থেকে সব ডেটা লোড করা
     
-    # --- *** Middleware টি সরিয়ে ফেলা হয়েছে *** ---
-    
     try:
+        # --- *** এই লগ মেসেজটি ঠিক করা হয়েছে *** ---
         await bot.send_message(ADMIN_ID, f"✅ বট রিস্টার্ট/চালু হয়েছে! ({len(USER_DATA)} জন ইউজার লোডেড)")
     except Exception as e:
         logging.warning(f"অ্যাডমিনকে ({ADMIN_ID}) মেসেজ পাঠানো যায়নি: {e}")
