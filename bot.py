@@ -57,7 +57,7 @@ try:
     users_collection = db["users_main"]
     sites_collection = db["sites"]
     config_collection = db["bot_config"]
-    proxies_collection = db["user_proxies"] # <-- *** এই লাইনটি যোগ করা হয়েছে ***
+    proxies_collection = db["user_proxies"] # <-- প্রক্সি কালেকশন
 except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
@@ -82,18 +82,24 @@ def run_flask():
 async def load_data_from_db():
     global USER_DATA, SITE_CONFIGS, BOT_CONFIG, USER_PROXIES
     try:
+        # --- ইউজার ডেটা লোড করা ---
         cursor = users_collection.find({})
         async for doc in cursor:
             USER_DATA[doc["user_id"]] = doc
         
+        # --- প্রক্সি ডেটা লোড করা এবং USER_DATA-তে মার্জ করা ---
         cursor_proxy = proxies_collection.find({})
-        async for doc in await cursor_proxy.to_list(None):
+        
+        # --- *** এই লুপটি ঠিক করা হয়েছে *** ---
+        proxy_list = await cursor_proxy.to_list(None) 
+        for doc in proxy_list: # <-- 'async for' থেকে 'async' সরানো হয়েছে
             user_id = doc["user_id"]
             if user_id not in USER_DATA:
                 USER_DATA[user_id] = {"user_id": user_id, "role": "user", "expires_at": 0, "banned": False}
             USER_DATA[user_id]["proxy"] = doc["proxy_data"]
             USER_PROXIES[str(user_id)] = doc["proxy_data"] 
 
+        # অ্যাডমিনকে পার্মানেন্ট অ্যাক্সেস দেওয়া
         if ADMIN_ID not in USER_DATA:
             admin_data = {
                 "user_id": ADMIN_ID,
@@ -108,11 +114,12 @@ async def load_data_from_db():
             USER_DATA[ADMIN_ID]["role"] = "admin"
             USER_DATA[ADMIN_ID]["expires_at"] = datetime.max.timestamp()
         
-        cursor = sites_collection.find({})
-        async for doc in cursor:
+        # --- সাইট কনফিগ লোড করা ---
+        cursor_sites = sites_collection.find({})
+        async for doc in cursor_sites: 
             SITE_CONFIGS[doc["site_key"]] = doc
         
-        if not SITE_CONFIGS: 
+        if not SITE_CONFIGS: # যদি কোনো সাইট না থাকে, ডিফল্টগুলি অ্যাড করা
             default_sites = {
                 "diy22": {"name": "Diy22", "api_endpoint": "https://diy22.club/api/user/signUp", "api_host": "diy22.club", "origin": "https://diy22.com", "referer": "https://diy22.com/", "reg_host": "diy22.com"},
                 "job777": {"name": "Job77", "api_endpoint": "https://job777.club/api/user/signUp", "api_host": "job777.club", "origin": "https://job777.com", "referer": "https://job777.com/", "reg_host": "job777.com"},
@@ -125,6 +132,7 @@ async def load_data_from_db():
                 await sites_collection.insert_one(config_with_key)
                 SITE_CONFIGS[key] = config_with_key
         
+        # --- বট কনফিগ লোড করা (গ্রুপ আইডি) ---
         bot_conf = await config_collection.find_one({"_id": "main_config"})
         if not bot_conf:
             BOT_CONFIG = {"group_id": None, "group_link": None}
@@ -658,11 +666,11 @@ async def process_proxy_user(message: types.Message, state: FSMContext):
 
 @dp.message(UserData.getting_proxy_pass)
 async def process_proxy_pass(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
+    user_data_state = await state.get_data()
     proxy_info = {
-        "host": user_data['proxy_host'],
-        "port": user_data['proxy_port'],
-        "user": user_data['proxy_user'],
+        "host": user_data_state.get('proxy_host'),
+        "port": user_data_state.get('proxy_port'),
+        "user": user_data_state.get('proxy_user'),
         "pass": message.text 
     }
     user_id = message.from_user.id
