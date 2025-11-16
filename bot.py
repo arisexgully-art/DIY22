@@ -19,7 +19,9 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest
+# --- *** নতুন: aiogram 3.7+ এর জন্য DefaultBotProperties ইম্পোর্ট *** ---
+from aiogram.client.default import DefaultBotProperties
 
 # --- এনক্রিপশন লাইব্রেরি ---
 from Crypto.Cipher import AES
@@ -37,10 +39,37 @@ ADMIN_USERNAME = "Sujay_X"
 SECRET_KEY = "djchdnfkxnjhgvuy".encode('utf-8')
 IV = "ayghjuiklobghfrt".encode('utf-8')
 
+SITE_CONFIGS = {
+    "diy22": {
+        "name": "Diy22", "api_endpoint": "https://diy22.club/api/user/signUp",
+        "api_host": "diy22.club", "origin": "https://diy22.com",
+        "referer": "https://diy22.com/", "reg_host": "diy22.com"
+    },
+    "job777": {
+        "name": "Job77", "api_endpoint": "https://job777.club/api/user/signUp",
+        "api_host": "job777.club", "origin": "https://job777.com",
+        "referer": "https://job777.com/", "reg_host": "job777.com"
+    },
+    "sms323": {
+        "name": "Sms323", "api_endpoint": "https://sms323.club/api/user/signUp",
+        "api_host": "sms323.club", "origin": "https://sms323.com",
+        "referer": "https://sms323.com/", "reg_host": "sms323.com"
+    },
+    "tg377": {
+        "name": "Tg377", "api_endpoint": "https://tg377.club/api/user/signUp",
+        "api_host": "tg377.club", "origin": "https://tg377.vip",
+        "referer": "https://tg377.vip/", "reg_host": "tg377.vip"
+    }
+}
+
 # --- গ্লোবাল ভেরিয়েবল ---
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML") # <-- ParseMode HTML সেট করা হলো
+
+# --- *** নতুন: বট চালু করার নিয়ম (aiogram 3.7+ অনুযায়ী) *** ---
+# আমরা parse_mode="HTML" কে DefaultBotProperties-এর ভেতরে সেট করছি
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+
 
 STOP_REQUESTS = {} # {user_id: True}
 
@@ -53,18 +82,14 @@ if not MONGO_URI:
 try:
     client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
     db = client["MyBotDatabase"] 
-    # --- নতুন কালেকশন ---
-    users_collection = db["users_main"] # <-- ইউজারদের সব তথ্য (রোল, প্রক্সি, ব্যান) এখানে থাকবে
-    sites_collection = db["sites"] # <-- সাইট কনফিগ
-    config_collection = db["bot_config"] # <-- গ্রুপ আইডি
+    approved_collection = db["approved_users"] 
+    proxies_collection = db["user_proxies"] 
 except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
 
-# --- গ্লোবাল ডিকশনারি (DB থেকে লোড হবে) ---
-USER_DATA = {} # { user_id: {"role": "...", "expires_at": ..., "banned": ..., "proxy": {...}} }
-SITE_CONFIGS = {}
-BOT_CONFIG = {} 
+APPROVED_USERS = {} # { user_id: expires_at_timestamp }
+USER_PROXIES = {} 
 
 # --- লগিং সেটআপ ---
 logging.basicConfig(level=logging.INFO)
@@ -79,80 +104,30 @@ def run_flask():
 
 # --- ধাপ ২: নতুন ডেটা লোড ফাংশন (DB থেকে) ---
 async def load_data_from_db():
-    global USER_DATA, SITE_CONFIGS, BOT_CONFIG
+    global APPROVED_USERS, USER_PROXIES
     try:
-        # --- ইউজার ডেটা লোড করা ---
-        cursor = users_collection.find({})
-        async for doc in cursor:
-            USER_DATA[doc["user_id"]] = doc
+        cursor = approved_collection.find({}, {"_id": 0, "user_id": 1, "expires_at": 1})
+        APPROVED_USERS = {doc["user_id"]: doc.get("expires_at", 0) for doc in await cursor.to_list(None)}
         
-        # অ্যাডমিনকে পার্মানেন্ট অ্যাক্সেস দেওয়া
-        if ADMIN_ID not in USER_DATA:
-            admin_data = {
-                "user_id": ADMIN_ID,
-                "role": "admin",
-                "expires_at": datetime.max.timestamp(),
-                "banned": False,
-                "proxy": None
-            }
-            await users_collection.insert_one(admin_data)
-            USER_DATA[ADMIN_ID] = admin_data
+        APPROVED_USERS[ADMIN_ID] = datetime.max.timestamp() 
         
-        # --- সাইট কনফিগ লোড করা ---
-        cursor = sites_collection.find({})
-        async for doc in cursor:
-            SITE_CONFIGS[doc["site_key"]] = doc
-        
-        # যদি কোনো সাইট না থাকে, ডিফল্টগুলি অ্যাড করা (শুধু প্রথমবার)
-        if not SITE_CONFIGS:
-            default_sites = {
-                "diy22": {"name": "Diy22", "api_endpoint": "https://diy22.club/api/user/signUp", "api_host": "diy22.club", "origin": "https://diy22.com", "referer": "https://diy22.com/", "reg_host": "diy22.com"},
-                "job777": {"name": "Job77", "api_endpoint": "https://job777.club/api/user/signUp", "api_host": "job777.club", "origin": "https://job777.com", "referer": "https://job777.com/", "reg_host": "job777.com"},
-                "sms323": {"name": "Sms323", "api_endpoint": "https://sms323.club/api/user/signUp", "api_host": "sms323.club", "origin": "https://sms323.com", "referer": "https://sms323.com/", "reg_host": "sms323.com"},
-                "tg377": {"name": "Tg377", "api_endpoint": "https://tg377.club/api/user/signUp", "api_host": "tg377.club", "origin": "https://tg377.vip", "referer": "https://tg377.vip/", "reg_host": "tg377.vip"}
-            }
-            for key, config in default_sites.items():
-                config_with_key = config.copy()
-                config_with_key["site_key"] = key
-                await sites_collection.insert_one(config_with_key)
-                SITE_CONFIGS[key] = config_with_key
-        
-        # --- বট কনফিগ লোড করা (গ্রুপ আইডি) ---
-        bot_conf = await config_collection.find_one({"_id": "main_config"})
-        if not bot_conf:
-            BOT_CONFIG = {"group_id": None, "group_link": None}
-            await config_collection.insert_one({"_id": "main_config", **BOT_CONFIG})
-        else:
-            BOT_CONFIG = bot_conf
-
-        logging.info(f"✅ DB থেকে {len(USER_DATA)} জন ইউজার, {len(SITE_CONFIGS)} টি সাইট, এবং গ্রুপ কনফিগ লোড হয়েছে।")
+        cursor = proxies_collection.find({})
+        for doc in await cursor.to_list(None):
+            USER_PROXIES[doc["user_id"]] = doc["proxy_data"]
+            
+        logging.info(f"✅ DB থেকে {len(APPROVED_USERS)} জন ইউজার ও {len(USER_PROXIES)} টি প্রক্সি লোড হয়েছে।")
     
     except Exception as e:
-        logging.critical(f"DB থেকে ডেটা লোড করায় মারাত্মক সমস্যা: {e}")
-        USER_DATA = {ADMIN_ID: {"role": "admin", "expires_at": datetime.max.timestamp(), "banned": False, "proxy": None}}
-        SITE_CONFIGS = {}
-        BOT_CONFIG = {"group_id": None, "group_link": None}
+        logging.error(f"DB থেকে ডেটা লোড করায় সমস্যা: {e}")
+        APPROVED_USERS = {ADMIN_ID: datetime.max.timestamp()}
+        USER_PROXIES = {}
 
 # --- অ্যাক্সেস চেক করার ফাংশন ---
-def get_user_status(user_id: int) -> dict:
-    """ইউজারের স্ট্যাটাস (রোল, মেয়াদ, ব্যান) চেক করে"""
-    user_doc = USER_DATA.get(user_id)
-    
-    if not user_doc:
-        return {"status": "new"} # নতুন ইউজার
-        
-    if user_doc.get("banned", False):
-        return {"status": "banned"} # ব্যানড
-        
-    if user_doc.get("role") == "admin":
-        return {"status": "active", "role": "admin"} # অ্যাডমিন
-        
-    expires_at = user_doc.get("expires_at", 0)
-    if datetime.now().timestamp() < expires_at:
-        role = user_doc.get("role", "user")
-        return {"status": "active", "role": role} # অ্যাক্টিভ (সাব-অ্যাডমিন বা ইউজার)
-    else:
-        return {"status": "expired"} # মেয়াদ শেষ
+def is_user_currently_approved(user_id: int) -> bool:
+    if user_id not in APPROVED_USERS:
+        return False
+    expires_at = APPROVED_USERS.get(user_id, 0)
+    return datetime.now().timestamp() < expires_at
 
 # --- ধাপ ৩: FSM স্টেট ---
 class UserData(StatesGroup):
@@ -160,11 +135,8 @@ class UserData(StatesGroup):
     getting_proxy_port = State()
     getting_proxy_user = State()
     getting_proxy_pass = State()
-    
     waiting_for_referral = State()
     waiting_for_amount = State()
-
-    # --- নতুন FSM ---
     adding_site_key = State()
     adding_site_name = State()
     adding_site_endpoint = State()
@@ -172,15 +144,11 @@ class UserData(StatesGroup):
     adding_site_origin = State()
     adding_site_referer = State()
     adding_site_reghost = State()
-    
     removing_site_key = State()
-    
     adding_sub_admin_id = State()
     removing_sub_admin_id = State()
-    
     banning_user_id = State()
     unbanning_user_id = State()
-    
     setting_group_id = State()
     setting_group_link = State()
 
@@ -193,7 +161,6 @@ def get_user_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, input_field_placeholder="Select an option...")
 
 def get_admin_keyboard() -> ReplyKeyboardMarkup:
-    """অ্যাডমিনের কীবোর্ড"""
     buttons = [
         [KeyboardButton(text="🚀 ACCOUNT CREATE (Admin)")],
         [KeyboardButton(text="📊 User List")],
@@ -202,15 +169,13 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-# --- নতুন: সাব-অ্যাডমিন কীবোর্ড ---
 def get_sub_admin_keyboard() -> ReplyKeyboardMarkup:
     buttons = [
-        [KeyboardButton(text="📊 List Approved Users")], # সাব-অ্যাডমিন শুধু লিস্ট দেখতে পাবে
+        [KeyboardButton(text="📊 List Approved Users")],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
     
 def get_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """নতুন: ৩০ মিনিট বাটন যোগ করা হয়েছে"""
     buttons = [
         [
             InlineKeyboardButton(text="✅ 30m", callback_data=f"approve:{user_id}:1800"),
@@ -237,7 +202,6 @@ def get_fsm_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_site_selection_keyboard() -> InlineKeyboardMarkup:
-    """নতুন: এখন এটি ডাইনামিক্যালি তৈরি হবে"""
     buttons = []
     for key, config in SITE_CONFIGS.items():
         buttons.append([InlineKeyboardButton(text=config["name"], callback_data=f"select_site:{key}")])
@@ -249,7 +213,6 @@ def get_contact_admin_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# --- নতুন: গ্রুপ জয়েন বাটন ---
 def get_join_verify_keyboard() -> InlineKeyboardMarkup:
     buttons = []
     if BOT_CONFIG.get("group_link"):
@@ -313,10 +276,9 @@ async def process_batch_task(
     site_name = site_config['name']
     try:
         await bot.edit_message_text(
-            f"✅ আপনার **{site_name}**-এর রিকোয়েস্টটি গ্রহণ করা হয়েছে এবং কাজ শুরু হচ্ছে...",
+            f"✅ আপনার <b>{site_name}</b>-এর রিকোয়েস্টটি গ্রহণ করা হয়েছে এবং কাজ শুরু হচ্ছে...",
             chat_id=user_id,
             message_id=handler_message_id,
-            parse_mode="HTML",
             reply_markup=get_stop_keyboard(user_id)
         )
     except Exception as e:
@@ -328,7 +290,7 @@ async def process_batch_task(
             username_number = generate_random_number(); encrypted_username = encrypt_data(username_number)
             if not encrypted_username:
                 await bot.edit_message_text(f"❌ ({site_name}) অ্যাকাউন্ট {i+1} এনক্রিপশনে সমস্যা। স্কিপ করা হলো।", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); continue 
-            await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n⏳ <code>{username_number}</code> তৈরি করা হচ্ছে...", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id))
+            await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> তৈরি করা হচ্ছে...", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
             
             success = False; attempt = 0; retry_delays = [0, 10, 30, 60]
             while not success:
@@ -338,8 +300,8 @@ async def process_batch_task(
                 if attempt < len(retry_delays): delay = retry_delays[attempt]
                 else: delay = 60 
                 if delay > 0:
-                    await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n⏳ <code>{username_number}</code> - সার্ভার ব্যাস্ত।\n⏱️ **{delay}** সেকেন্ড পর আবার চেষ্টা করা হচ্ছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id)); await asyncio.sleep(delay)
-                await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n⏳ <code>{username_number}</code> - API কল চলছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id))
+                    await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> - সার্ভার ব্যাস্ত।\n⏱️ <b>{delay}</b> সেকেন্ড পর আবার চেষ্টা করা হচ্ছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); await asyncio.sleep(delay)
+                await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> - API কল চলছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
                 
                 session_id = random.randint(100000, 999999); rotated_proxy_user = f"{proxy_user}-session-{session_id}"
                 proxy_url = f"http://{rotated_proxy_user}:{proxy_pass}@{proxy_host}:{proxy_port}"
@@ -347,20 +309,20 @@ async def process_batch_task(
                 api_success, data = await call_api(encrypted_username, referral_code, proxy_url, site_config) 
                 
                 if api_success: 
-                    await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n✅ <code>{username_number}</code> সফলভাবে তৈরি হয়েছে!", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id)); created_accounts.append((username_number, "123456")); success = True 
+                    await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n✅ <code>{username_number}</code> সফলভাবে তৈরি হয়েছে!", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); created_accounts.append((username_number, "123456")); success = True 
                 else: 
                     api_message = data.get('msg', 'Unknown Error').lower()
                     if "already exist" in api_message or "username already" in api_message or "invite code invalid" in api_message:
-                        await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n❌ <code>{username_number}</code> তৈরিতে ব্যর্থ: {data.get('msg', 'API Error')}", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id)); break 
+                        await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n❌ <code>{username_number}</code> তৈরিতে ব্যর্থ: {data.get('msg', 'API Error')}", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); break 
                     else: attempt += 1; continue 
             if user_stopped: break 
             await asyncio.sleep(1) 
 
         if not user_stopped:
             if created_accounts:
-                await bot.edit_message_text(f"✅ ({site_name}) সমস্ত কাজ সম্পন্ন হয়েছে!\n🎉 মোট {len(created_accounts)} টি অ্যাকাউন্ট সফলভাবে তৈরি হয়েছে।", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=None)
+                await bot.edit_message_text(f"✅ ({site_name}) সমস্ত কাজ সম্পন্ন হয়েছে!\n🎉 মোট {len(created_accounts)} টি অ্যাকাউন্ট সফলভাবে তৈরি হয়েছে।", chat_id=user_id, message_id=handler_message_id, reply_markup=None)
             else:
-                await bot.edit_message_text(f"ℹ️ ({site_name}) কাজ সম্পন্ন হয়েছে, কিন্তু কোনো অ্যাকাউন্ট তৈরি করা সম্ভব হয়নি।", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=None)
+                await bot.edit_message_text(f"ℹ️ ({site_name}) কাজ সম্পন্ন হয়েছে, কিন্তু কোনো অ্যাকাউন্ট তৈরি করা সম্ভব হয়নি।", chat_id=user_id, message_id=handler_message_id, reply_markup=None)
         
         if created_accounts:
             file_content = ""; [file_content := file_content + f"{user}\n{pw}\n" for user, pw in created_accounts]
@@ -381,7 +343,7 @@ async def process_batch_task_admin(user_id: int, amount: int, referral_code: str
     user_stopped = False
     site_name = site_config['name']
     try:
-        await bot.edit_message_text(f"✅ (অ্যাডমিন মোড) আপনার **{site_name}**-এর রিকোয়েস্টটি গ্রহণ করা হয়েছে এবং কাজ শুরু হচ্ছে...", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id))
+        await bot.edit_message_text(f"✅ (অ্যাডমিন মোড) আপনার <b>{site_name}</b>-এর রিকোয়েস্টটি গ্রহণ করা হয়েছে এবং কাজ শুরু হচ্ছে...", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
     except Exception as e:
         logging.error(f"Admin {user_id} কে মেসেজ এডিট করা যায়নি: {e}"); return
     try:
@@ -391,7 +353,7 @@ async def process_batch_task_admin(user_id: int, amount: int, referral_code: str
             username_number = generate_random_number(); encrypted_username = encrypt_data(username_number)
             if not encrypted_username:
                 await bot.edit_message_text(f"❌ ({site_name}) অ্যাকাউন্ট {i+1} এনক্রিপশনে সমস্যা। স্কিপ করা হলো।", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); continue 
-            await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n⏳ <code>{username_number}</code> তৈরি করা হচ্ছে...", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id))
+            await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> তৈরি করা হচ্ছে...", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
             success = False; attempt = 0; retry_delays = [0, 10, 30, 60]
             while not success:
                 if STOP_REQUESTS.get(user_id):
@@ -400,25 +362,25 @@ async def process_batch_task_admin(user_id: int, amount: int, referral_code: str
                 if attempt < len(retry_delays): delay = retry_delays[attempt]
                 else: delay = 60 
                 if delay > 0:
-                    await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n⏳ <code>{username_number}</code> - সার্ভার ব্যাস্ত।\n⏱️ **{delay}** সেকেন্ড পর আবার চেষ্টা করা হচ্ছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id)); await asyncio.sleep(delay)
-                await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n⏳ <code>{username_number}</code> - API কল চলছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id))
+                    await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> - সার্ভার ব্যাস্ত।\n⏱️ <b>{delay}</b> সেকেন্ড পর আবার চেষ্টা করা হচ্ছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); await asyncio.sleep(delay)
+                await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> - API কল চলছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
                 
                 api_success, data = await call_api(encrypted_username, referral_code, None, site_config) # <-- প্রক্সি None
                 
                 if api_success: 
-                    await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n✅ <code>{username_number}</code> সফলভাবে তৈরি হয়েছে!", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id)); created_accounts.append((username_number, "123456")); success = True 
+                    await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n✅ <code>{username_number}</code> সফলভাবে তৈরি হয়েছে!", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); created_accounts.append((username_number, "123456")); success = True 
                 else: 
                     api_message = data.get('msg', 'Unknown Error').lower()
                     if "already exist" in api_message or "username already" in api_message or "invite code invalid" in api_message:
-                        await bot.edit_message_text(f"📊 ({site_name}) **অবস্থান:** {i+1}/{amount}\n❌ <code>{username_number}</code> তৈরিতে ব্যর্থ: {data.get('msg', 'API Error')}", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=get_stop_keyboard(user_id)); break 
+                        await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n❌ <code>{username_number}</code> তৈরিতে ব্যর্থ: {data.get('msg', 'API Error')}", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); break 
                     else: attempt += 1; continue 
             if user_stopped: break 
             await asyncio.sleep(1) 
         if not user_stopped:
             if created_accounts:
-                await bot.edit_message_text(f"✅ ({site_name}) সমস্ত কাজ সম্পন্ন হয়েছে!\n🎉 মোট {len(created_accounts)} টি অ্যাকাউন্ট সফলভাবে তৈরি হয়েছে।", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=None)
+                await bot.edit_message_text(f"✅ ({site_name}) সমস্ত কাজ সম্পন্ন হয়েছে!\n🎉 মোট {len(created_accounts)} টি অ্যাকাউন্ট সফলভাবে তৈরি হয়েছে।", chat_id=user_id, message_id=handler_message_id, reply_markup=None)
             else:
-                await bot.edit_message_text(f"ℹ️ ({site_name}) কাজ সম্পন্ন হয়েছে, কিন্তু কোনো অ্যাকাউন্ট তৈরি করা সম্ভব হয়নি।", chat_id=user_id, message_id=handler_message_id, parse_mode="HTML", reply_markup=None)
+                await bot.edit_message_text(f"ℹ️ ({site_name}) কাজ সম্পন্ন হয়েছে, কিন্তু কোনো অ্যাকাউন্ট তৈরি করা সম্ভব হয়নি।", chat_id=user_id, message_id=handler_message_id, reply_markup=None)
 
         if created_accounts:
             file_content = ""; [file_content := file_content + f"{user}\n{pw}\n" for user, pw in created_accounts]
@@ -435,19 +397,15 @@ async def process_batch_task_admin(user_id: int, amount: int, referral_code: str
 
 # --- ধাপ ৮: টেলিগ্রাম বট হ্যান্ডলার ---
 
-# --- অ্যাডমিন: ইউজার লিস্ট দেখা ---
 @dp.message(F.text == "📊 User List")
 async def list_approved_users(message: types.Message, state: FSMContext):
-    if USER_DATA.get(message.from_user.id, {}).get("role") not in ["admin", "sub-admin"]: return
+    user_role = USER_DATA.get(message.from_user.id, {}).get("role")
+    if user_role not in ["admin", "sub-admin"]: return
+    
     await state.clear()
-    
-    text_lines = ["👤 **User Access List:**\n"]
-    if len(USER_DATA) <= 1: 
-        text_lines.append(" (No users yet)")
-    
+    text = "👤 **User Access List:**\n"; text += " (No users yet)" if len(USER_DATA) <= 1 else ""
     now = datetime.now().timestamp()
     
-    # ইউজারদের সর্ট করা
     sorted_users = sorted(USER_DATA.items(), key=lambda item: item[1].get('role', 'user'))
 
     for user_id, data in sorted_users:
@@ -472,10 +430,8 @@ async def list_approved_users(message: types.Message, state: FSMContext):
 
     await message.answer("\n".join(text_lines), reply_markup=get_admin_keyboard() if USER_DATA.get(message.from_user.id, {}).get("role") == "admin" else get_sub_admin_keyboard())
 
-# --- অ্যাডমিন/সাব-অ্যাডমিন: ইউজার অ্যাপ্রুভ করা ---
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
-    # --- নতুন: সাব-অ্যাডমিনও অ্যাপ্রুভ করতে পারবে ---
     user_role = USER_DATA.get(query.from_user.id, {}).get("role")
     if user_role not in ["admin", "sub-admin"]:
         await query.answer("❗️ এটি শুধুমাত্র অ্যাডমিন বা সাব-অ্যাডমিন করতে পারে।", show_alert=True); return
@@ -489,7 +445,6 @@ async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
 
     expires_at = datetime.now().timestamp() + duration_seconds
     
-    # নতুন ইউজার হলে ডিফল্ট ডেটা
     user_data = USER_DATA.get(user_id_to_approve, {
         "user_id": user_id_to_approve,
         "role": "user",
@@ -498,7 +453,7 @@ async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
     })
     
     user_data["expires_at"] = expires_at
-    user_data["role"] = "user" # অ্যাপ্রুভ করলে সে সব সময় "user"
+    user_data["role"] = "user"
     
     await users_collection.update_one(
         {"user_id": user_id_to_approve},
@@ -524,7 +479,6 @@ async def approve_user_handler(query: types.CallbackQuery, state: FSMContext):
         logging.error(f"অ্যাপ্রুভড ইউজারকে মেসেজ পাঠানো যায়নি: {e}")
     await query.answer("User approved!")
 
-# --- /start হ্যান্ডলার ---
 @dp.message(CommandStart())
 async def send_welcome(message: types.Message, state: FSMContext):
     user_id = message.from_user.id; user_name = message.from_user.full_name
@@ -548,9 +502,8 @@ async def send_welcome(message: types.Message, state: FSMContext):
                              reply_markup=get_sub_admin_keyboard())
         return
 
-    # --- নতুন: গ্রুপ জয়েন চেক ---
     group_id = BOT_CONFIG.get("group_id")
-    if group_id: # যদি অ্যাডমিন কোনো গ্রুপ সেট করে থাকে
+    if group_id:
         try:
             member = await bot.get_chat_member(chat_id=group_id, user_id=user_id)
             if member.status not in ["member", "administrator", "creator"]:
@@ -558,27 +511,20 @@ async def send_welcome(message: types.Message, state: FSMContext):
                                      reply_markup=get_join_verify_keyboard())
                 return
         except (TelegramForbiddenError, TelegramBadRequest):
-             # বটটি গ্রুপে নেই বা গ্রুপ আইডি ভুল
              logging.error(f"গ্রুপ {group_id} চেক করা যায়নি। বট কি গ্রুপের অ্যাডমিন?")
-             # যদি গ্রুপ চেক ফেইল হয়, তবে নরমাল ফ্লোতে যেতে দেওয়া
-             pass
         except Exception as e:
             logging.error(f"গ্রুপ মেম্বার চেক করায় সমস্যা: {e}")
 
-    # --- গ্রুপ ভেরিফাইড বা গ্রুপ সেট করা নেই ---
-    
     if status == "new" or status == "expired":
         msg_text = "👋 স্বাগতম!" if status == "new" else "❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে।"
         await message.answer(f"{msg_text}\n⏳ আপনার রিকোয়েস্ট অ্যাডমিন প্যানেলে পাঠানো হয়েছে। অনুগ্রহ করে অপেক্ষা করুন...",
                              reply_markup=get_contact_admin_keyboard())
         
-        # --- নতুন: সমস্ত অ্যাডমিন ও সাব-অ্যাডমিনকে নোটিফাই করা ---
         admin_list = [uid for uid, data in USER_DATA.items() if data.get("role") in ["admin", "sub-admin"]]
-        
         request_type = "New User Request" if status == "new" else "User Renewal Request"
         
         for admin_id in admin_list:
-            if admin_id == user_id: continue # নিজেকে নোটিফিকেশন না পাঠানো
+            if admin_id == user_id: continue
             try:
                 await bot.send_message(admin_id, f"❗️ **{request_type}** ❗️\n\n"
                                        f"**Name:** {message.from_user.full_name}\n**User ID:** <code>{user_id}</code>\n\n"
@@ -588,7 +534,6 @@ async def send_welcome(message: types.Message, state: FSMContext):
                 logging.error(f"অ্যাডমিন/সাব-অ্যাডমিন {admin_id} কে নোটিফিকেশন পাঠানো যায়নি: {e}")
         return
 
-    # কেস: ইউজার অ্যাক্টিভ কিন্তু প্রক্সি সেট করা নেই
     if str(user_id) not in USER_PROXIES:
         await message.answer(f"👋 স্বাগতম, {user_name}!\n\n"
                              "এই বটটি ব্যবহার করার জন্য প্রথমে আপনার ABC প্রক্সি সেট করতে হবে।\n\n"
@@ -598,17 +543,14 @@ async def send_welcome(message: types.Message, state: FSMContext):
         await state.set_state(UserData.getting_proxy_host)
         return
 
-    # কেস: ইউজার অ্যাক্টিভ এবং প্রক্সি সেট করা আছে
     await message.answer(f"স্বাগতম, {user_name}! 👋\nঅ্যাকাউন্ট তৈরি করতে নিচের বাটনগুলি ব্যবহার করুন:",
                          reply_markup=get_user_keyboard())
 
-# --- নতুন: গ্রুপ ভেরিফাই হ্যান্ডলার ---
 @dp.callback_query(F.data == "verify_join")
 async def verify_join_handler(query: types.CallbackQuery, state: FSMContext):
     group_id = BOT_CONFIG.get("group_id")
     if not group_id:
-        await query.answer("গ্রুপ সেটআপ করা হয়নি।", show_alert=True)
-        return
+        await query.answer("গ্রুপ সেটআপ করা হয়নি।", show_alert=True); return
 
     try:
         member = await bot.get_chat_member(chat_id=group_id, user_id=query.from_user.id)
@@ -617,14 +559,10 @@ async def verify_join_handler(query: types.CallbackQuery, state: FSMContext):
             return
     except Exception as e:
         await query.answer("❌ ভেরিফাই করার সময় সমস্যা হয়েছে। অ্যাডমিনের সাথে যোগাযোগ করুন।", show_alert=True)
-        logging.error(f"ভেরিফাই করার সময় এরর: {e}")
-        return
+        logging.error(f"ভেরিফাই করার সময় এরর: {e}"); return
     
-    # ইউজার ভেরিফাইড!
-    await query.message.delete() # "Join" মেসেজটি ডিলিট করা
+    await query.message.delete()
     await query.answer("✅ ভেরিফিকেশন সফল!")
-    
-    # এখন /start-এর নরমাল ফ্লো আবার চালানো
     await send_welcome(query.message, state)
 
 
@@ -646,12 +584,11 @@ async def cancel_fsm_handler(query: types.CallbackQuery, state: FSMContext):
     try:
         await query.message.edit_text("❌ অপারেশনটি বাতিল করা হয়েছে।")
     except TelegramBadRequest as e:
-        if "message to edit not found" in str(e): # যদি মেসেজ আগেই ডিলিট হয়ে যায়
+        if "message to edit not found" in str(e):
             await query.message.answer("❌ অপারেশনটি বাতিল করা হয়েছে।")
         else: raise e
     await query.answer()
 
-# --- প্রক্সি হ্যান্ডলার ---
 @dp.message(F.text == "⚙️ Set/Update Proxy")
 async def handle_set_proxy(message: types.Message, state: FSMContext):
     if not is_user_currently_approved(message.from_user.id):
@@ -707,7 +644,7 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
     user_id_str = str(message.from_user.id)
     USER_PROXIES[user_id_str] = proxy_info
     await proxies_collection.update_one(
-        {"user_id": user_id_str},
+        {"user_id": int(user_id_str)},
         {"$set": {"proxy_data": proxy_info}},
         upsert=True
     )
@@ -718,37 +655,40 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
                          f"আপনি এখন অ্যাকাউন্ট তৈরি করতে পারেন।",
                          reply_markup=get_user_keyboard()); await state.set_state(None)
 
-# --- অ্যাকাউন্ট ক্রিয়েট ফ্লো ---
 @dp.message(F.text == "🚀 ACCOUNT CREATE")
 @dp.message(F.text == "🚀 ACCOUNT CREATE (Admin)")
 async def show_site_selection(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        if not is_user_currently_approved(user_id):
-             await message.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে। /start চাপুন।"); return
-        if str(user_id) not in USER_PROXIES:
-            await message.answer("❌ আপনি এখনও প্রক্সি সেট করেননি।\n"
-                                 "দয়া করে প্রথমে '⚙️ Set/Update Proxy' বাটন চেপে আপনার প্রক্সি সেট করুন।",
-                                 reply_markup=get_user_keyboard())
-            return
+    status_info = get_user_status(user_id)
+    
+    if status_info.get("status") != "active":
+        await message.answer("❌ আপনার এই বটটি ব্যবহার করার অনুমতি নেই বা মেয়াদ শেষ হয়ে গেছে। /start চাপুন।"); return
+        
+    if status_info.get("role") != "admin" and not USER_DATA.get(user_id, {}).get("proxy"):
+        await message.answer("❌ আপনি এখনও প্রক্সি সেট করেননি।\n"
+                             "দয়া করে প্রথমে '⚙️ Set/Update Proxy' বাটন চেপে আপনার প্রক্সি সেট করুন।",
+                             reply_markup=get_user_keyboard())
+        return
             
     await message.answer("আপনি কোন সাইটের জন্য অ্যাকাউন্ট তৈরি করতে চান?",
                          reply_markup=get_site_selection_keyboard())
 
 @dp.callback_query(F.data.startswith("select_site:"))
 async def start_creation_process(query: types.CallbackQuery, state: FSMContext):
-    if not is_user_currently_approved(query.from_user.id):
+    user_id = query.from_user.id
+    status_info = get_user_status(user_id)
+    
+    if status_info.get("status") != "active":
         await query.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে। /start চাপুন।", show_alert=True); return
         
     site_key = query.data.split(":")[-1]
     if site_key not in SITE_CONFIGS:
         await query.answer("❌ অবৈধ সাইট।", show_alert=True); return
     
-    if query.from_user.id != ADMIN_ID:
-        if str(query.from_user.id) not in USER_PROXIES:
-            await query.message.answer("❌ আপনি এখনও প্রক্সি সেট করেননি।\n"
-                                       "দয়া করে প্রথমে '⚙️ Set/Update Proxy' বাটন চেপে আপনার প্রক্সি সেট করুন।")
-            await query.answer(); return
+    if status_info.get("role") != "admin" and not USER_DATA.get(user_id, {}).get("proxy"):
+        await query.message.answer("❌ আপনি এখনও প্রক্সি সেট করেননি।\n"
+                                   "দয়া করে প্রথমে '⚙️ Set/Update Proxy' বাটন চেপে আপনার প্রক্সি সেট করুন।")
+        await query.answer(); return
 
     await state.update_data(selected_site=site_key)
     
@@ -832,22 +772,21 @@ async def process_amount_and_queue(message: types.Message, state: FSMContext):
         await message.answer(f"একটি ত্রুটি ঘটেছে: {e}"); await state.clear()
 
 
-# --- ------------------- ---
-# --- নতুন অ্যাডমিন হ্যান্ডলার ---
-# --- ------------------- ---
+# --- অ্যাডমিন ম্যানেজমেন্ট হ্যান্ডলারগুলি এখানে ... ---
+# (আগের কোডের handle_site_mgt, add_site_start, ..., set_group_link_finish পর্যন্ত সব ফাংশন এখানে পেস্ট করুন)
 
 # --- সাইট ম্যানেজমেন্ট ---
 @dp.message(F.text == "🌐 Site Mgt")
 async def handle_site_mgt(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+    if USER_DATA.get(message.from_user.id, {}).get("role") != "admin": return
     await state.clear()
     
-    text = "🌐 **Site Management**\n\nবর্তমান সাইট:\n"
+    text = "🌐 <b>Site Management</b>\n\nবর্তমান সাইট:\n"
     if not SITE_CONFIGS:
         text += "(খালি)"
     else:
         for key, config in SITE_CONFIGS.items():
-            text += f"- **{config['name']}** (key: <code>{key}</code>)\n"
+            text += f"- <b>{config['name']}</b> (key: <code>{key}</code>)\n"
             
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Add New Site", callback_data="add_site")],
@@ -856,7 +795,7 @@ async def handle_site_mgt(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "add_site")
 async def add_site_start(query: types.CallbackQuery, state: FSMContext):
-    if query.from_user.id != ADMIN_ID: await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
+    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
     await query.message.answer("1/7: অনুগ্রহ করে সাইটের একটি ইউনিক <b>key</b> দিন (e.g., <code>newsite123</code>)",
                                reply_markup=get_fsm_cancel_keyboard())
     await state.set_state(UserData.adding_site_key)
@@ -926,7 +865,7 @@ async def add_site_reghost(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "remove_site")
 async def remove_site_start(query: types.CallbackQuery, state: FSMContext):
-    if query.from_user.id != ADMIN_ID: await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
+    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
     await query.message.answer("অনুগ্রহ করে যে সাইটটি ডিলিট করতে চান তার <b>key</b> টি টাইপ করুন:",
                                reply_markup=get_fsm_cancel_keyboard())
     await state.set_state(UserData.removing_site_key)
@@ -948,10 +887,10 @@ async def remove_site_finish(message: types.Message, state: FSMContext):
 # --- সাব-অ্যাডমিন ম্যানেজমেন্ট ---
 @dp.message(F.text == "🛡️ Sub-Admin Mgt")
 async def handle_sub_admin_mgt(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+    if USER_DATA.get(message.from_user.id, {}).get("role") != "admin": return
     await state.clear()
     
-    text = "🛡️ **Sub-Admin List:**\n"
+    text = "🛡️ <b>Sub-Admin List:</b>\n"
     sub_admins = [uid for uid, data in USER_DATA.items() if data.get("role") == "sub-admin"]
     
     if not sub_admins:
@@ -967,7 +906,7 @@ async def handle_sub_admin_mgt(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "add_sub_admin")
 async def add_sub_admin_start(query: types.CallbackQuery, state: FSMContext):
-    if query.from_user.id != ADMIN_ID: await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
+    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
     await query.message.answer("অনুগ্রহ করে নতুন সাব-অ্যাডমিনের <b>User ID</b> টাইপ করুন:",
                                reply_markup=get_fsm_cancel_keyboard())
     await state.set_state(UserData.adding_sub_admin_id)
@@ -992,7 +931,7 @@ async def add_sub_admin_finish(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "remove_sub_admin")
 async def remove_sub_admin_start(query: types.CallbackQuery, state: FSMContext):
-    if query.from_user.id != ADMIN_ID: await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
+    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
     await query.message.answer("অনুগ্রহ করে যে সাব-অ্যাডমিনকে সরাতে চান তার <b>User ID</b> টাইপ করুন:",
                                reply_markup=get_fsm_cancel_keyboard())
     await state.set_state(UserData.removing_sub_admin_id)
@@ -1009,7 +948,6 @@ async def remove_sub_admin_finish(message: types.Message, state: FSMContext):
         await message.answer("❌ এই ইউজারটি সাব-অ্যাডমিন নয়।", reply_markup=get_admin_keyboard())
         await state.clear(); return
         
-    # ইউজারকে "user" রোলে নামিয়ে আনা এবং অ্যাক্সেস এক্সপায়ার করে দেওয়া
     USER_DATA[user_id]["role"] = "user"
     USER_DATA[user_id]["expires_at"] = 0 
     await users_collection.update_one(
@@ -1023,7 +961,7 @@ async def remove_sub_admin_finish(message: types.Message, state: FSMContext):
 # --- ইউজার ব্যান ম্যানেজমেন্ট ---
 @dp.message(F.text == "🚫 User Ban Mgt")
 async def handle_user_ban_mgt(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+    if USER_DATA.get(message.from_user.id, {}).get("role") != "admin": return
     await state.clear()
     await message.answer("আপনি কী করতে চান?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚫 Ban User", callback_data="ban_user")],
@@ -1032,7 +970,7 @@ async def handle_user_ban_mgt(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "ban_user")
 async def ban_user_start(query: types.CallbackQuery, state: FSMContext):
-    if query.from_user.id != ADMIN_ID: await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
+    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
     await query.message.answer("অনুগ্রহ করে যে ইউজারকে ব্যান করতে চান তার <b>User ID</b> টাইপ করুন:",
                                reply_markup=get_fsm_cancel_keyboard())
     await state.set_state(UserData.banning_user_id)
@@ -1059,7 +997,7 @@ async def ban_user_finish(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "unban_user")
 async def unban_user_start(query: types.CallbackQuery, state: FSMContext):
-    if query.from_user.id != ADMIN_ID: await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
+    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
     await query.message.answer("অনুগ্রহ করে যে ইউজারকে আনব্যান করতে চান তার <b>User ID</b> টাইপ করুন:",
                                reply_markup=get_fsm_cancel_keyboard())
     await state.set_state(UserData.unbanning_user_id)
@@ -1085,13 +1023,13 @@ async def unban_user_finish(message: types.Message, state: FSMContext):
 # --- গ্রুপ ম্যানেজমেন্ট ---
 @dp.message(F.text == "🔗 Group Mgt")
 async def handle_group_mgt(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+    if USER_DATA.get(message.from_user.id, {}).get("role") != "admin": return
     await state.clear()
     
     group_id = BOT_CONFIG.get("group_id")
     group_link = BOT_CONFIG.get("group_link")
     
-    text = f"🔗 **Group Join Management**\n\n"
+    text = f"🔗 <b>Group Join Management</b>\n\n"
     text += f"<b>Current Group ID:</b> <code>{group_id}</code>\n" if group_id else "<b>Current Group ID:</b> <code>Not Set</code>\n"
     text += f"<b>Current Group Link:</b> {group_link}\n" if group_link else "<b>Current Group Link:</b> <code>Not Set</code>\n"
             
@@ -1102,7 +1040,7 @@ async def handle_group_mgt(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "set_group_id")
 async def set_group_id_start(query: types.CallbackQuery, state: FSMContext):
-    if query.from_user.id != ADMIN_ID: await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
+    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
     await query.message.answer("অনুগ্রহ করে আপনার গ্রুপের <b>Chat ID</b> টাইপ করুন (এটি -100... দিয়ে শুরু হয়)।\n\n"
                                "<b>টিপ:</b> বটটিকে আপনার গ্রুপে অ্যাডমিন বানান, তারপর গ্রুপে <code>/get_id</code> টাইপ করুন।",
                                reply_markup=get_fsm_cancel_keyboard())
@@ -1128,7 +1066,7 @@ async def set_group_id_finish(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "set_group_link")
 async def set_group_link_start(query: types.CallbackQuery, state: FSMContext):
-    if query.from_user.id != ADMIN_ID: await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
+    if USER_DATA.get(query.from_user.id, {}).get("role") != "admin": await query.answer("শুধুমাত্র অ্যাডমিন!", show_alert=True); return
     await query.message.answer("অনুগ্রহ করে আপনার গ্রুপের <b>Invite Link</b> টাইপ করুন (e.g., <code>https://t.me/mygroup</code>)",
                                reply_markup=get_fsm_cancel_keyboard())
     await state.set_state(UserData.setting_group_link)
@@ -1142,201 +1080,12 @@ async def set_group_link_finish(message: types.Message, state: FSMContext):
     await message.answer(f"✅ গ্রুপ লিঙ্ক {group_link}-এ সেট করা হয়েছে।", reply_markup=get_admin_keyboard())
     await state.clear()
 
-# --- ------------------- ---
-# --- সাধারণ ইউজার হ্যান্ডলার ---
-# --- ------------------- ---
-
-# --- প্রক্সি হ্যান্ডলার ---
-@dp.message(F.text == "⚙️ Set/Update Proxy")
-async def handle_set_proxy(message: types.Message, state: FSMContext):
-    status_info = get_user_status(message.from_user.id)
-    if status_info.get("status") != "active":
-        await message.answer("❌ আপনার এই বটটি ব্যবহার করার অনুমতি নেই বা মেয়াদ শেষ হয়ে গেছে। /start চাপুন।"); return
-    
-    await state.clear() 
-    if USER_DATA.get(message.from_user.id, {}).get("proxy"):
-        await message.answer("✅ আপনার প্রক্সি ইতিমধ্যেই সেভ করা আছে।\n"
-                             "যদি এটি পরিবর্তন করতে চান, '🔄 Change Proxy' বাটনে ক্লিক করুন।",
-                             reply_markup=get_user_keyboard())
-        return
-    await message.answer("🔑 আপনার ABC প্রক্সি সেটআপ শুরু করছি।\n\n"
-                         "দয়া করে **Host** টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
-                         reply_markup=types.ReplyKeyboardRemove()); await state.set_state(UserData.getting_proxy_host)
-
-@dp.message(F.text == "🔄 Change Proxy")
-async def handle_change_proxy(message: types.Message, state: FSMContext):
-    if not is_user_currently_approved(message.from_user.id):
-        await message.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে। /start চাপুন।"); return
-    await state.clear() 
-    await message.answer("🔑 আপনার নতুন ABC প্রক্সি সেটআপ শুরু করছি।\n\n"
-                         "দয়া করে **Host** টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
-                         reply_markup=types.ReplyKeyboardRemove()); await state.set_state(UserData.getting_proxy_host)
-
-@dp.message(UserData.getting_proxy_host)
-async def process_proxy_host(message: types.Message, state: FSMContext):
-    await state.update_data(proxy_host=message.text)
-    await message.answer("✅ Host সেভ হয়েছে।\n\nএবার **Port** টি লিখুন:\n(e.g., 4950)")
-    await state.set_state(UserData.getting_proxy_port)
-
-@dp.message(UserData.getting_proxy_port)
-async def process_proxy_port(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("❌ পোর্ট অবশ্যই একটি সংখ্যা হতে হবে। দয়া করে আবার চেষ্টা করুন।"); return
-    await state.update_data(proxy_port=message.text)
-    await message.answer("✅ Port সেভ হয়েছে।\n\nএবার **Username** টি লিখুন:\n(e.g., SujayJT1111-zone-abc-region-SA)")
-    await state.set_state(UserData.getting_proxy_user)
-
-@dp.message(UserData.getting_proxy_user)
-async def process_proxy_user(message: types.Message, state: FSMContext):
-    await state.update_data(proxy_user=message.text)
-    await message.answer("✅ Username সেভ হয়েছে।\n\nএবার **Password** টি লিখুন:\n(e.g., VieMTaD5K4I)")
-    await state.set_state(UserData.getting_proxy_pass)
-
-@dp.message(UserData.getting_proxy_pass)
-async def process_proxy_pass(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    proxy_info = {
-        "host": user_data['proxy_host'],
-        "port": user_data['proxy_port'],
-        "user": user_data['proxy_user'],
-        "pass": message.text 
-    }
-    user_id = message.from_user.id
-    USER_DATA.setdefault(user_id, {})["proxy"] = proxy_info
-    
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"proxy": proxy_info}},
-        upsert=True
-    )
-    
-    await message.answer(f"✅ **প্রক্সি সফলভাবে সেভ হয়েছে!**\n\n"
-                         f"<b>Host:</b> <code>{proxy_info['host']}</code>\n<b>Port:</b> <code>{proxy_info['port']}</code>\n"
-                         f"<b>User:</b> <code>{proxy_info['user']}</code>\n\n"
-                         f"আপনি এখন অ্যাকাউন্ট তৈরি করতে পারেন।",
-                         reply_markup=get_user_keyboard()); await state.set_state(None)
-
-# --- অ্যাকাউন্ট ক্রিয়েট ফ্লো ---
-@dp.message(F.text == "🚀 ACCOUNT CREATE")
-@dp.message(F.text == "🚀 ACCOUNT CREATE (Admin)")
-async def show_site_selection(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    status_info = get_user_status(user_id)
-    
-    if status_info["status"] != "active":
-        await message.answer("❌ আপনার এই বটটি ব্যবহার করার অনুমতি নেই বা মেয়াদ শেষ হয়ে গেছে। /start চাপুন।"); return
-        
-    if status_info["role"] != "admin" and not USER_DATA.get(user_id, {}).get("proxy"):
-        await message.answer("❌ আপনি এখনও প্রক্সি সেট করেননি।\n"
-                             "দয়া করে প্রথমে '⚙️ Set/Update Proxy' বাটন চেপে আপনার প্রক্সি সেট করুন।",
-                             reply_markup=get_user_keyboard())
-        return
-            
-    await message.answer("আপনি কোন সাইটের জন্য অ্যাকাউন্ট তৈরি করতে চান?",
-                         reply_markup=get_site_selection_keyboard())
-
-@dp.callback_query(F.data.startswith("select_site:"))
-async def start_creation_process(query: types.CallbackQuery, state: FSMContext):
-    user_id = query.from_user.id
-    status_info = get_user_status(user_id)
-    
-    if status_info["status"] != "active":
-        await query.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে। /start চাপুন।", show_alert=True); return
-        
-    site_key = query.data.split(":")[-1]
-    if site_key not in SITE_CONFIGS:
-        await query.answer("❌ অবৈধ সাইট।", show_alert=True); return
-    
-    if status_info["role"] != "admin" and not USER_DATA.get(user_id, {}).get("proxy"):
-        await query.message.answer("❌ আপনি এখনও প্রক্সি সেট করেননি।\n"
-                                   "দয়া করে প্রথমে '⚙️ Set/Update Proxy' বাটন চেপে আপনার প্রক্সি সেট করুন।")
-        await query.answer(); return
-
-    await state.update_data(selected_site=site_key)
-    
-    handler_msg = await query.message.answer(
-        f"🔑 ({SITE_CONFIGS[site_key]['name']}) দয়া করে আপনার রেফার কোডটি টাইপ করুন:", 
-        reply_markup=get_fsm_cancel_keyboard()
-    )
-    await state.update_data(handler_message_id=handler_msg.message_id)
-    await state.set_state(UserData.waiting_for_referral)
-    await query.answer()
-
-@dp.message(UserData.waiting_for_referral)
-async def process_referral(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    handler_msg_id = user_data.get("handler_message_id")
-    site_key = user_data.get("selected_site", "diy22")
-    site_name = SITE_CONFIGS.get(site_key, {}).get("name", "")
-    
-    if not handler_msg_id:
-        await state.clear(); await message.answer("একটি সমস্যা হয়েছে, /start দিন।"); return
-
-    await state.update_data(referral=message.text)
-    
-    try:
-        await bot.edit_message_text(
-            f"📈 ({site_name}) এখন আপনি কতগুলি অ্যাকাউন্ট তৈরি করতে চান? (সর্বোচ্চ 20 টি)",
-            chat_id=message.chat.id,
-            message_id=handler_msg_id,
-            reply_markup=get_fsm_cancel_keyboard()
-        )
-        await state.set_state(UserData.waiting_for_amount)
-    except Exception as e:
-        logging.error(f"FSM (referral) এডিট করায় সমস্যা: {e}")
-    finally:
-        await message.delete() 
-
-@dp.message(UserData.waiting_for_amount)
-async def process_amount_and_queue(message: types.Message, state: FSMContext):
-    try:
-        amount = int(message.text)
-        if not (0 < amount <= 20):
-            await message.answer("❌ সর্বোচ্চ **20** টি অ্যাকাউন্ট একসাথে তৈরি করা যাবে।\n"
-                                 "দয়া করে 20 বা তার কম একটি সংখ্যা দিন।")
-            await message.delete(); return
-        
-        user_data = await state.get_data(); referral_code = user_data.get('referral'); site_key = user_data.get('selected_site')
-        handler_msg_id = user_data.get("handler_message_id")
-
-        if not all([handler_msg_id, referral_code, site_key]):
-             await state.clear()
-             await bot.edit_message_text("❌ একটি ত্রুটি ঘটেছে (Ref/SiteKey)। দয়া করে /start দিয়ে আবার চেষ্টা করুন।", chat_id=message.chat.id, message_id=handler_msg_id)
-             await message.delete(); return
-        
-        site_config = SITE_CONFIGS[site_key]
-        
-        if message.from_user.id == ADMIN_ID:
-            asyncio.create_task(
-                process_batch_task_admin(message.from_user.id, amount, referral_code, site_config, handler_msg_id)
-            )
-        else:
-            try:
-                proxy_data = USER_DATA[message.from_user.id]["proxy"]
-                proxy_host = proxy_data['host']; proxy_port = proxy_data['port']
-                proxy_user = proxy_data['user']; proxy_pass = proxy_data['pass']
-            except (KeyError, TypeError):
-                 await bot.edit_message_text("❌ আপনার প্রক্সি সেভ করা নেই। দয়া করে 'Set/Update Proxy' দিয়ে আবার সেট করুন।", chat_id=message.chat.id, message_id=handler_msg_id)
-                 await state.clear(); await message.delete(); return
-            
-            asyncio.create_task(
-                process_batch_task(message.from_user.id, amount, referral_code, site_config, 
-                                   proxy_host, proxy_port, proxy_user, proxy_pass, handler_msg_id)
-            )
-        
-        await state.clear() 
-        await message.delete() 
-        
-    except ValueError:
-        await message.answer("❌ এটি একটি সংখ্যা নয়। দয়া করে শুধুমাত্র সংখ্যা লিখুন।")
-        await message.delete() 
-    except Exception as e:
-        await message.answer(f"একটি ত্রুটি ঘটেছে: {e}"); await state.clear()
-
 # --- ধাপ ৯: বট চালু করা ---
 async def main():
     """বট চালু করে"""
     await load_data_from_db() # <-- DB থেকে সব ডেটা লোড করা
+    
+    # --- *** Middleware টি সরিয়ে ফেলা হয়েছে *** ---
     
     try:
         await bot.send_message(ADMIN_ID, f"✅ বট রিস্টার্ট/চালু হয়েছে! ({len(USER_DATA)} জন ইউজার লোডেড)")
