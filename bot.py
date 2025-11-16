@@ -19,7 +19,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.client.default import DefaultBotProperties
 
 # --- এনক্রিপশন লাইব্রেরি ---
@@ -595,7 +595,8 @@ async def verify_join_handler(query: types.CallbackQuery, state: FSMContext):
     
     await query.message.delete()
     await query.answer("✅ ভেরিফিকেশন সফল!")
-    await send_welcome(query.message, state) # <-- /start ফ্লো আবার চালানো
+    # /start রি-ট্রিগার করার জন্য একটি নতুন মেসেজ অবজেক্ট তৈরি করা হচ্ছে
+    await send_welcome(query.message, state)
 
 
 @dp.callback_query(F.data.startswith("stop:"))
@@ -610,21 +611,30 @@ async def stop_creation_handler(query: types.CallbackQuery, state: FSMContext):
         await query.message.edit_text("⏳ অপারেশনটি বাতিল করা হচ্ছে...", reply_markup=None)
     except TelegramBadRequest: pass 
 
+# --- *** এই ফাংশনটি আপডেট করা হয়েছে *** ---
 @dp.callback_query(F.data == "cancel_fsm")
 async def cancel_fsm_handler(query: types.CallbackQuery, state: FSMContext):
     await state.clear()
     try:
-        await query.message.edit_text("❌ অপারেশনটি বাতিল করা হয়েছে।")
+        await query.message.edit_text("❌ অপারেশনটি বাতিল করা হয়েছে।", reply_markup=None)
+        await query.answer("বাতিল করা হয়েছে।")
     except TelegramBadRequest as e:
-        if "message to edit not found" in str(e):
-            await query.message.answer("❌ অপারেশনটি বাতিল করা হয়েছে।")
-        else: raise e
-    await query.answer()
+        if "message is not modified" in str(e):
+            await query.answer("✅ ইতিমধ্যেই বাতিল করা হয়েছে।")
+        elif "message to edit not found" in str(e):
+            # যদি মেসেজটি খুঁজে না পায়, তাহলে শুধু অ্যালার্ট দেখানো হবে
+            await query.answer("❌ অপারেশনটি ইতিমধ্যেই বাতিল বা সম্পন্ন হয়েছে।", show_alert=True)
+        else: 
+            logging.error(f"FSM Cancel-এ অন্য এরর: {e}")
+            await query.answer("একটি সমস্যা হয়েছে।", show_alert=True)
 
+# --- *** এই ফাংশনটি আপডেট করা হয়েছে *** ---
 @dp.message(F.text == "⚙️ Set/Update Proxy")
 async def handle_set_proxy(message: types.Message, state: FSMContext):
-    if not is_user_currently_approved(message.from_user.id):
+    status_info = get_user_status(message.from_user.id)
+    if status_info.get("status") != "active":
         await message.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে। /start চাপুন।"); return
+    
     await state.clear() 
     if USER_DATA.get(message.from_user.id, {}).get("proxy"):
         await message.answer("✅ আপনার প্রক্সি ইতিমধ্যেই সেভ করা আছে।\n"
@@ -635,10 +645,13 @@ async def handle_set_proxy(message: types.Message, state: FSMContext):
                          "দয়া করে <b>Host</b> টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
                          reply_markup=types.ReplyKeyboardRemove()); await state.set_state(UserData.getting_proxy_host)
 
+# --- *** এই ফাংশনটি আপডেট করা হয়েছে *** ---
 @dp.message(F.text == "🔄 Change Proxy")
 async def handle_change_proxy(message: types.Message, state: FSMContext):
-    if not is_user_currently_approved(message.from_user.id):
+    status_info = get_user_status(message.from_user.id)
+    if status_info.get("status") != "active":
         await message.answer("❌ আপনার অ্যাক্সেসের মেয়াদ শেষ হয়ে গেছে। /start চাপুন।"); return
+    
     await state.clear() 
     await message.answer("🔑 আপনার নতুন ABC প্রক্সি সেটআপ শুরু করছি।\n\n"
                          "দয়া করে <b>Host</b> টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
