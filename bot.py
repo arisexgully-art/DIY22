@@ -7,7 +7,7 @@ import io
 import json
 import os 
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta # <-- টাইমারের জন্য জরুরি
 
 from flask import Flask 
 
@@ -20,8 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
-# --- *** নতুন: aiogram 3.7+ এর জন্য DefaultBotProperties ইম্পোর্ট *** ---
-from aiogram.client.default import DefaultBotProperties
+from aiogram.client.default import DefaultBotProperties # <-- aiogram 3.7+ এর জন্য
 
 # --- এনক্রিপশন লাইব্রেরি ---
 from Crypto.Cipher import AES
@@ -65,11 +64,7 @@ SITE_CONFIGS = {
 # --- গ্লোবাল ভেরিয়েবল ---
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-
-# --- *** নতুন: বট চালু করার নিয়ম (aiogram 3.7+ অনুযায়ী) *** ---
-# আমরা parse_mode="HTML" কে DefaultBotProperties-এর ভেতরে সেট করছি
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-
 
 STOP_REQUESTS = {} # {user_id: True}
 
@@ -82,14 +77,17 @@ if not MONGO_URI:
 try:
     client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
     db = client["MyBotDatabase"] 
-    approved_collection = db["approved_users"] 
-    proxies_collection = db["user_proxies"] 
+    users_collection = db["users_main"]
+    sites_collection = db["sites"]
+    config_collection = db["bot_config"]
 except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
 
-APPROVED_USERS = {} # { user_id: expires_at_timestamp }
-USER_PROXIES = {} 
+# --- *** এই ভেরিয়েবলগুলি এখন গ্লোবাল *** ---
+USER_DATA = {} 
+SITE_CONFIGS = {}
+BOT_CONFIG = {} 
 
 # --- লগিং সেটআপ ---
 logging.basicConfig(level=logging.INFO)
@@ -104,30 +102,80 @@ def run_flask():
 
 # --- ধাপ ২: নতুন ডেটা লোড ফাংশন (DB থেকে) ---
 async def load_data_from_db():
-    global APPROVED_USERS, USER_PROXIES
+    # --- *** গ্লোবাল ভেরিয়েবলগুলি ডিক্লেয়ার করা হলো *** ---
+    global USER_DATA, SITE_CONFIGS, BOT_CONFIG
     try:
-        cursor = approved_collection.find({}, {"_id": 0, "user_id": 1, "expires_at": 1})
-        APPROVED_USERS = {doc["user_id"]: doc.get("expires_at", 0) for doc in await cursor.to_list(None)}
+        # --- ইউজার ডেটা লোড করা ---
+        cursor = users_collection.find({})
+        async for doc in cursor:
+            USER_DATA[doc["user_id"]] = doc
         
-        APPROVED_USERS[ADMIN_ID] = datetime.max.timestamp() 
+        if ADMIN_ID not in USER_DATA:
+            admin_data = {
+                "user_id": ADMIN_ID,
+                "role": "admin",
+                "expires_at": datetime.max.timestamp(),
+                "banned": False,
+                "proxy": None
+            }
+            await users_collection.insert_one(admin_data)
+            USER_DATA[ADMIN_ID] = admin_data
         
-        cursor = proxies_collection.find({})
-        for doc in await cursor.to_list(None):
-            USER_PROXIES[doc["user_id"]] = doc["proxy_data"]
-            
-        logging.info(f"✅ DB থেকে {len(APPROVED_USERS)} জন ইউজার ও {len(USER_PROXIES)} টি প্রক্সি লোড হয়েছে।")
+        # --- সাইট কনফিগ লোড করা ---
+        cursor = sites_collection.find({})
+        async for doc in cursor:
+            SITE_CONFIGS[doc["site_key"]] = doc
+        
+        if not SITE_CONFIGS:
+            default_sites = {
+                "diy22": {"name": "Diy22", "api_endpoint": "https://diy22.club/api/user/signUp", "api_host": "diy22.club", "origin": "https://diy22.com", "referer": "https://diy22.com/", "reg_host": "diy22.com"},
+                "job777": {"name": "Job77", "api_endpoint": "https://job777.club/api/user/signUp", "api_host": "job777.club", "origin": "https://job777.com", "referer": "https://job777.com/", "reg_host": "job777.com"},
+                "sms323": {"name": "Sms323", "api_endpoint": "https://sms323.club/api/user/signUp", "api_host": "sms323.club", "origin": "https://sms323.com", "referer": "https://sms323.com/", "reg_host": "sms323.com"},
+                "tg377": {"name": "Tg377", "api_endpoint": "https://tg377.club/api/user/signUp", "api_host": "tg377.club", "origin": "https://tg377.vip", "referer": "https://tg377.vip/", "reg_host": "tg377.vip"}
+            }
+            for key, config in default_sites.items():
+                config_with_key = config.copy()
+                config_with_key["site_key"] = key
+                await sites_collection.insert_one(config_with_key)
+                SITE_CONFIGS[key] = config_with_key
+        
+        # --- বট কনফিগ লোড করা (গ্রুপ আইডি) ---
+        bot_conf = await config_collection.find_one({"_id": "main_config"})
+        if not bot_conf:
+            BOT_CONFIG = {"group_id": None, "group_link": None}
+            await config_collection.insert_one({"_id": "main_config", **BOT_CONFIG})
+        else:
+            BOT_CONFIG = bot_conf
+
+        logging.info(f"✅ DB থেকে {len(USER_DATA)} জন ইউজার, {len(SITE_CONFIGS)} টি সাইট, এবং গ্রুপ কনফিগ লোড হয়েছে।")
     
     except Exception as e:
-        logging.error(f"DB থেকে ডেটা লোড করায় সমস্যা: {e}")
-        APPROVED_USERS = {ADMIN_ID: datetime.max.timestamp()}
-        USER_PROXIES = {}
+        logging.critical(f"DB থেকে ডেটা লোড করায় মারাত্মক সমস্যা: {e}")
+        USER_DATA = {ADMIN_ID: {"role": "admin", "expires_at": datetime.max.timestamp(), "banned": False, "proxy": None}}
+        SITE_CONFIGS = {}
+        BOT_CONFIG = {"group_id": None, "group_link": None}
+
 
 # --- অ্যাক্সেস চেক করার ফাংশন ---
-def is_user_currently_approved(user_id: int) -> bool:
-    if user_id not in APPROVED_USERS:
-        return False
-    expires_at = APPROVED_USERS.get(user_id, 0)
-    return datetime.now().timestamp() < expires_at
+def get_user_status(user_id: int) -> dict:
+    """ইউজারের স্ট্যাটাস (রোল, মেয়াদ, ব্যান) চেক করে"""
+    user_doc = USER_DATA.get(user_id)
+    
+    if not user_doc:
+        return {"status": "new"} # নতুন ইউজার
+        
+    if user_doc.get("banned", False):
+        return {"status": "banned"} # ব্যানড
+        
+    if user_doc.get("role") == "admin":
+        return {"status": "active", "role": "admin"} # অ্যাডমিন
+        
+    expires_at = user_doc.get("expires_at", 0)
+    if datetime.now().timestamp() < expires_at:
+        role = user_doc.get("role", "user")
+        return {"status": "active", "role": role} # অ্যাক্টিভ (সাব-অ্যাডমিন বা ইউজার)
+    else:
+        return {"status": "expired"} # মেয়াদ শেষ
 
 # --- ধাপ ৩: FSM স্টেট ---
 class UserData(StatesGroup):
@@ -171,7 +219,7 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 
 def get_sub_admin_keyboard() -> ReplyKeyboardMarkup:
     buttons = [
-        [KeyboardButton(text="📊 List Approved Users")],
+        [KeyboardButton(text="📊 List Approved Users")], # এটি User List-এই কল করবে
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
     
@@ -403,7 +451,10 @@ async def list_approved_users(message: types.Message, state: FSMContext):
     if user_role not in ["admin", "sub-admin"]: return
     
     await state.clear()
-    text = "👤 **User Access List:**\n"; text += " (No users yet)" if len(USER_DATA) <= 1 else ""
+    text_lines = ["👤 <b>User Access List:</b>\n"]
+    if len(USER_DATA) <= 1: 
+        text_lines.append(" (No users yet)")
+    
     now = datetime.now().timestamp()
     
     sorted_users = sorted(USER_DATA.items(), key=lambda item: item[1].get('role', 'user'))
@@ -772,8 +823,7 @@ async def process_amount_and_queue(message: types.Message, state: FSMContext):
         await message.answer(f"একটি ত্রুটি ঘটেছে: {e}"); await state.clear()
 
 
-# --- অ্যাডমিন ম্যানেজমেন্ট হ্যান্ডলারগুলি এখানে ... ---
-# (আগের কোডের handle_site_mgt, add_site_start, ..., set_group_link_finish পর্যন্ত সব ফাংশন এখানে পেস্ট করুন)
+# --- অ্যাডমিন ম্যানেজমেন্ট হ্যান্ডলারগুলি ---
 
 # --- সাইট ম্যানেজমেন্ট ---
 @dp.message(F.text == "🌐 Site Mgt")
