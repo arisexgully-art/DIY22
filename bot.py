@@ -7,7 +7,7 @@ import io
 import json
 import os 
 import threading
-from datetime import datetime, timedelta # <-- *** এই লাইনটি যোগ করা হয়েছে ***
+from datetime import datetime, timedelta
 
 from flask import Flask 
 
@@ -20,7 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.client.default import DefaultBotProperties # <-- aiogram 3.7+ এর জন্য
+from aiogram.client.default import DefaultBotProperties
 
 # --- এনক্রিপশন লাইব্রেরি ---
 from Crypto.Cipher import AES
@@ -57,15 +57,15 @@ try:
     users_collection = db["users_main"]
     sites_collection = db["sites"]
     config_collection = db["bot_config"]
+    proxies_collection = db["user_proxies"] # <-- *** এই লাইনটি যোগ করা হয়েছে ***
 except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
 
-# --- *** এই ভেরিয়েবলগুলি এখন গ্লোবাল *** ---
 USER_DATA = {} 
 SITE_CONFIGS = {}
 BOT_CONFIG = {} 
-USER_PROXIES = {} # <-- *** এই লাইনটি যোগ করা হয়েছে ***
+USER_PROXIES = {} 
 
 # --- লগিং সেটআপ ---
 logging.basicConfig(level=logging.INFO)
@@ -80,24 +80,20 @@ def run_flask():
 
 # --- ধাপ ২: নতুন ডেটা লোড ফাংশন (DB থেকে) ---
 async def load_data_from_db():
-    # --- *** গ্লোবাল ভেরিয়েবলগুলি ডিক্লেয়ার করা হলো *** ---
     global USER_DATA, SITE_CONFIGS, BOT_CONFIG, USER_PROXIES
     try:
-        # --- ইউজার ডেটা লোড করা (Approve/Ban/Role/Expires) ---
         cursor = users_collection.find({})
         async for doc in cursor:
             USER_DATA[doc["user_id"]] = doc
         
-        # --- প্রক্সি ডেটা লোড করা এবং USER_DATA-তে মার্জ করা ---
         cursor_proxy = proxies_collection.find({})
         async for doc in await cursor_proxy.to_list(None):
             user_id = doc["user_id"]
             if user_id not in USER_DATA:
                 USER_DATA[user_id] = {"user_id": user_id, "role": "user", "expires_at": 0, "banned": False}
             USER_DATA[user_id]["proxy"] = doc["proxy_data"]
-            USER_PROXIES[str(user_id)] = doc["proxy_data"] # <-- *** USER_PROXIES পপুলেট করা ***
+            USER_PROXIES[str(user_id)] = doc["proxy_data"] 
 
-        # অ্যাডমিনকে পার্মানেন্ট অ্যাক্সেস দেওয়া
         if ADMIN_ID not in USER_DATA:
             admin_data = {
                 "user_id": ADMIN_ID,
@@ -112,12 +108,11 @@ async def load_data_from_db():
             USER_DATA[ADMIN_ID]["role"] = "admin"
             USER_DATA[ADMIN_ID]["expires_at"] = datetime.max.timestamp()
         
-        # --- সাইট কনফিগ লোড করা ---
         cursor = sites_collection.find({})
         async for doc in cursor:
             SITE_CONFIGS[doc["site_key"]] = doc
         
-        if not SITE_CONFIGS: # যদি কোনো সাইট না থাকে, ডিফল্টগুলি অ্যাড করা (শুধু প্রথমবার)
+        if not SITE_CONFIGS: 
             default_sites = {
                 "diy22": {"name": "Diy22", "api_endpoint": "https://diy22.club/api/user/signUp", "api_host": "diy22.club", "origin": "https://diy22.com", "referer": "https://diy22.com/", "reg_host": "diy22.com"},
                 "job777": {"name": "Job77", "api_endpoint": "https://job777.club/api/user/signUp", "api_host": "job777.club", "origin": "https://job777.com", "referer": "https://job777.com/", "reg_host": "job777.com"},
@@ -130,7 +125,6 @@ async def load_data_from_db():
                 await sites_collection.insert_one(config_with_key)
                 SITE_CONFIGS[key] = config_with_key
         
-        # --- বট কনফিগ লোড করা (গ্রুপ আইডি) ---
         bot_conf = await config_collection.find_one({"_id": "main_config"})
         if not bot_conf:
             BOT_CONFIG = {"group_id": None, "group_link": None}
@@ -149,23 +143,19 @@ async def load_data_from_db():
 
 # --- অ্যাক্সেস চেক করার ফাংশন ---
 def get_user_status(user_id: int) -> dict:
-    """ইউজারের স্ট্যাটাস (রোল, মেয়াদ, ব্যান) চেক করে"""
     user_doc = USER_DATA.get(user_id)
     
     if not user_doc:
-        return {"status": "new"} # নতুন ইউজার
-        
+        return {"status": "new"}
     if user_doc.get("banned", False):
-        return {"status": "banned"} # ব্যানড
-        
+        return {"status": "banned"}
     if user_doc.get("role") == "admin":
-        return {"status": "active", "role": "admin"} # অ্যাডমিন
-        
+        return {"status": "active", "role": "admin"}
     expires_at = user_doc.get("expires_at", 0)
     if datetime.now().timestamp() < expires_at:
-        return {"status": "active", "role": "user"} # অ্যাক্টিভ ইউজার (সাব-অ্যাডমিন রোল বাদ)
+        return {"status": "active", "role": "user"}
     else:
-        return {"status": "expired"} # মেয়াদ শেষ
+        return {"status": "expired"}
 
 # --- ধাপ ৩: FSM স্টেট ---
 class UserData(StatesGroup):
@@ -173,11 +163,8 @@ class UserData(StatesGroup):
     getting_proxy_port = State()
     getting_proxy_user = State()
     getting_proxy_pass = State()
-    
     waiting_for_referral = State()
     waiting_for_amount = State()
-
-    # --- অ্যাডমিন FSM ---
     adding_site_key = State()
     adding_site_name = State()
     adding_site_endpoint = State()
@@ -185,12 +172,9 @@ class UserData(StatesGroup):
     adding_site_origin = State()
     adding_site_referer = State()
     adding_site_reghost = State()
-    
     removing_site_key = State()
-    
     banning_user_id = State()
     unbanning_user_id = State()
-    
     setting_group_id = State()
     setting_group_link = State()
 
@@ -203,7 +187,6 @@ def get_user_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, input_field_placeholder="Select an option...")
 
 def get_admin_keyboard() -> ReplyKeyboardMarkup:
-    """অ্যাডমিনের কীবোর্ড (সাব-অ্যাডমিন বাটন সরানো হয়েছে)"""
     buttons = [
         [KeyboardButton(text="🚀 ACCOUNT CREATE (Admin)")],
         [KeyboardButton(text="📊 User List")],
@@ -213,7 +196,6 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
     
 def get_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """নতুন: ৩০ মিনিট বাটন যোগ করা হয়েছে"""
     buttons = [
         [
             InlineKeyboardButton(text="✅ 30m", callback_data=f"approve:{user_id}:1800"),
