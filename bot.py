@@ -33,7 +33,6 @@ if not BOT_TOKEN:
     exit()
 
 ADMIN_ID = 8308179143
-# --- *** আপডেট: অ্যাডমিন ইউজারনেম *** ---
 ADMIN_USERNAME = "saif20256" 
 
 SECRET_KEY = "djchdnfkxnjhgvuy".encode('utf-8')
@@ -59,6 +58,7 @@ try:
     sites_collection = db["sites"]
     config_collection = db["bot_config"]
     proxies_collection = db["user_proxies"] 
+    history_collection = db["used_history"] 
 except Exception as e:
     logging.critical(f"MongoDB কানেক্ট করা যায়নি: {e}")
     exit()
@@ -83,14 +83,11 @@ def run_flask():
 async def load_data_from_db():
     global USER_DATA, SITE_CONFIGS, BOT_CONFIG, USER_PROXIES
     try:
-        # --- ইউজার ডেটা লোড করা ---
         cursor = users_collection.find({})
         async for doc in cursor:
             USER_DATA[doc["user_id"]] = doc
         
-        # --- প্রক্সি ডেটা লোড করা এবং USER_DATA-তে মার্জ করা ---
         cursor_proxy = proxies_collection.find({})
-        
         proxy_list = await cursor_proxy.to_list(None) 
         for doc in proxy_list:
             user_id = doc["user_id"]
@@ -99,7 +96,6 @@ async def load_data_from_db():
             USER_DATA[user_id]["proxy"] = doc["proxy_data"]
             USER_PROXIES[str(user_id)] = doc["proxy_data"] 
 
-        # অ্যাডমিনকে পার্মানেন্ট অ্যাক্সেস দেওয়া
         if ADMIN_ID not in USER_DATA:
             admin_data = {
                 "user_id": ADMIN_ID,
@@ -114,12 +110,11 @@ async def load_data_from_db():
             USER_DATA[ADMIN_ID]["role"] = "admin"
             USER_DATA[ADMIN_ID]["expires_at"] = datetime.max.timestamp()
         
-        # --- সাইট কনফিগ লোড করা ---
         cursor_sites = sites_collection.find({})
         async for doc in cursor_sites: 
             SITE_CONFIGS[doc["site_key"]] = doc
         
-        if not SITE_CONFIGS: # যদি কোনো সাইট না থাকে, ডিফল্টগুলি অ্যাড করা
+        if not SITE_CONFIGS: 
             default_sites = {
                 "diy22": {"name": "Diy22", "api_endpoint": "https://diy22.club/api/user/signUp", "api_host": "diy22.club", "origin": "https://diy22.com", "referer": "https://diy22.com/", "reg_host": "diy22.com"},
                 "job777": {"name": "Job77", "api_endpoint": "https://job777.club/api/user/signUp", "api_host": "job777.club", "origin": "https://job777.com", "referer": "https://job777.com/", "reg_host": "job777.com"},
@@ -132,7 +127,6 @@ async def load_data_from_db():
                 await sites_collection.insert_one(config_with_key)
                 SITE_CONFIGS[key] = config_with_key
         
-        # --- বট কনফিগ লোড করা (গ্রুপ আইডি) ---
         bot_conf = await config_collection.find_one({"_id": "main_config"})
         if not bot_conf:
             BOT_CONFIG = {"group_id": None, "group_link": None}
@@ -262,7 +256,17 @@ def encrypt_data(data_str: str) -> str:
 def generate_random_number(length: int = 10) -> str:
     return "".join(random.choices("0123456789", k=length))
 
-# --- ধাপ ৬: API কল ---
+# --- ইউনিক নম্বর জেনারেটর (DB চেক সহ) ---
+async def get_unique_random_number() -> str:
+    """জেনারেট করে এবং চেক করে যে নম্বরটি আগে ব্যবহৃত হয়েছে কিনা"""
+    for _ in range(50): 
+        num = generate_random_number()
+        exists = await history_collection.find_one({"username": num})
+        if not exists:
+            return num
+    return generate_random_number()
+
+# --- ধাপ ৬: API কল (Fast Mode) ---
 async def call_api(encrypted_username: str, invite_code: str, proxy_url: str | None, site_config: dict) -> tuple[bool, dict]:
     payload = {
         'username': encrypted_username, 'password': '123456',
@@ -276,24 +280,27 @@ async def call_api(encrypted_username: str, invite_code: str, proxy_url: str | N
         "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36",
         "token": ""
     }
-    if proxy_url: logging.info(f"প্রক্সি {proxy_url.split('@')[-1]} দিয়ে {site_config['name']}-এ কল করা হচ্ছে...")
-    else: logging.info(f"প্রক্সি ছাড়া {site_config['name']}-এ কল করা হচ্ছে...")
+    # --- Fast Log: প্রক্সি ডিটেইলস লগিং কমানো হয়েছে স্পিডের জন্য ---
+    # if proxy_url: logging.info(f"Trying proxy...") 
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.post(
-                site_config['api_endpoint'], data=payload, timeout=30, proxy=proxy_url
+                site_config['api_endpoint'], 
+                data=payload, 
+                timeout=15, # --- অপ্টিমাইজেশন: টাইমআউট কমিয়ে ১৫ সেকেন্ড করা হয়েছে (Fail Fast) ---
+                proxy=proxy_url
             ) as response:
                 try: response_data = await response.json()
                 except aiohttp.ContentTypeError: response_data = {"code": -1, "msg": f"JSON Error (Status: {response.status})"}
                 return (True, response_data) if response.status == 200 and response_data.get('code') == 1 else (False, response_data)
-    except aiohttp.ClientProxyConnectionError as e:
-        logging.error(f"প্রক্সি কানেকশনে সমস্যা: {proxy_url} - {e}"); return False, {"code": -1, "msg": f"প্রক্সি এরর (আবার চেষ্টা করা হচ্ছে)"}
+    except aiohttp.ClientProxyConnectionError:
+        return False, {"code": -1, "msg": "Proxy Connection Error"}
     except asyncio.TimeoutError:
-        logging.error("API কল টাইমআউট।"); return False, {"code": -1, "msg": "সার্ভার টাইমআউট (আবার চেষ্টা করা হচ্ছে)"}
+        return False, {"code": -1, "msg": "Timeout"}
     except Exception as e:
-        logging.error(f"API কল করার সময় এরর: {e}"); return False, {"code": -1, "msg": "সার্ভারের সাথে সংযোগ করা যাচ্ছে না (আবার চেষ্টা করা হচ্ছে)"}
+        return False, {"code": -1, "msg": f"Error: {str(e)}"}
 
-# --- ধাপ ৭: টাস্ক প্রসেসর (ইউজার) ---
+# --- ধাপ ৭: টাস্ক প্রসেসর (Fast Optimized) ---
 async def process_batch_task(
     user_id: int, amount: int, referral_code: str, site_config: dict, 
     proxy_host: str, proxy_port: str, proxy_user: str, proxy_pass: str,
@@ -315,36 +322,63 @@ async def process_batch_task(
         for i in range(amount):
             if STOP_REQUESTS.get(user_id):
                 user_stopped = True; del STOP_REQUESTS[user_id]; await bot.edit_message_text("⏹️ অপারেশনটি বাতিল করা হয়েছে।", chat_id=user_id, message_id=handler_message_id, reply_markup=None); break 
-            username_number = generate_random_number(); encrypted_username = encrypt_data(username_number)
+            
+            username_number = await get_unique_random_number()
+            encrypted_username = encrypt_data(username_number)
+            
             if not encrypted_username:
-                await bot.edit_message_text(f"❌ ({site_name}) অ্যাকাউন্ট {i+1} এনক্রিপশনে সমস্যা। স্কিপ করা হলো।", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); continue 
+                await bot.edit_message_text(f"❌ ({site_name}) অ্যাকাউন্ট {i+1} এনক্রিপশনে সমস্যা।", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); continue 
+            
             await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> তৈরি করা হচ্ছে...", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
             
-            success = False; attempt = 0; retry_delays = [0, 10, 30, 60]
+            success = False
+            attempt = 0
+            # --- অপ্টিমাইজেশন: রিট্রাই ডিলে অনেক কমানো হয়েছে ---
+            retry_delays = [1, 2, 2, 3] 
+            
             while not success:
                 if STOP_REQUESTS.get(user_id):
                     user_stopped = True; del STOP_REQUESTS[user_id]; await bot.edit_message_text("⏹️ অপারেশনটি বাতিল করা হয়েছে।", chat_id=user_id, message_id=handler_message_id, reply_markup=None); break 
-                delay = 0
-                if attempt < len(retry_delays): delay = retry_delays[attempt]
-                else: delay = 60 
-                if delay > 0:
-                    await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> - সার্ভার ব্যাস্ত।\n⏱️ <b>{delay}</b> সেকেন্ড পর আবার চেষ্টা করা হচ্ছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); await asyncio.sleep(delay)
-                await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> - API কল চলছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
                 
-                session_id = random.randint(100000, 999999); rotated_proxy_user = f"{proxy_user}-session-{session_id}"
+                # --- অপ্টিমাইজেশন: প্রতি অ্যাটেম্পটে প্রক্সি সেশন চেঞ্জ ---
+                session_id = random.randint(100000, 9999999)
+                rotated_proxy_user = f"{proxy_user}-session-{session_id}"
                 proxy_url = f"http://{rotated_proxy_user}:{proxy_pass}@{proxy_host}:{proxy_port}"
-                
+
                 api_success, data = await call_api(encrypted_username, referral_code, proxy_url, site_config) 
                 
                 if api_success: 
+                    await history_collection.insert_one({"username": username_number, "site": site_config['site_key'], "time": datetime.now()})
                     await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n✅ <code>{username_number}</code> সফলভাবে তৈরি হয়েছে!", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); created_accounts.append((username_number, "123456")); success = True 
                 else: 
                     api_message = data.get('msg', 'Unknown Error').lower()
-                    if "already exist" in api_message or "username already" in api_message or "invite code invalid" in api_message:
-                        await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n❌ <code>{username_number}</code> তৈরিতে ব্যর্থ: {data.get('msg', 'API Error')}", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); break 
-                    else: attempt += 1; continue 
+                    
+                    if "already exist" in api_message or "username already" in api_message:
+                        await history_collection.insert_one({"username": username_number, "status": "failed_exist"})
+                        username_number = await get_unique_random_number()
+                        encrypted_username = encrypt_data(username_number)
+                        attempt = 0 
+                        await bot.edit_message_text(f"⚠️ ডুপ্লিকেট! নতুন নম্বর: <code>{username_number}</code>", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
+                        # কোনো ডিলে ছাড়াই কন্টিনিউ
+                        continue 
+                    
+                    elif "invite code invalid" in api_message:
+                         await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n❌ ইনভ্যালিড ইনভাইট কোড।", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); break
+                    
+                    else: 
+                        # --- অপ্টিমাইজেশন: সার্ভার বিজি বা অন্য এররে খুব কম ডিলে ---
+                        delay = retry_delays[attempt] if attempt < len(retry_delays) else 3
+                        # মেসেজ এডিট না করে শুধু লগ করুন স্পিডের জন্য, যদি না ৫ বারের বেশি হয়
+                        if attempt > 2:
+                            await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> - রিট্রাই ({attempt})...", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
+                        
+                        await asyncio.sleep(delay)
+                        attempt += 1
+                        continue
+                        
             if user_stopped: break 
-            await asyncio.sleep(1) 
+            # সফল হওয়ার পর খুব সামান্য বিরতি
+            await asyncio.sleep(0.5) 
 
         if not user_stopped:
             if created_accounts:
@@ -365,7 +399,7 @@ async def process_batch_task(
     finally:
         if user_id in STOP_REQUESTS: del STOP_REQUESTS[user_id]
         
-# --- টাস্ক প্রসেসর (অ্যাডমিন) ---
+# --- টাস্ক প্রসেসর (অ্যাডমিন - Fast Mode) ---
 async def process_batch_task_admin(user_id: int, amount: int, referral_code: str, site_config: dict, handler_message_id: int):
     created_accounts = []
     user_stopped = False
@@ -378,32 +412,48 @@ async def process_batch_task_admin(user_id: int, amount: int, referral_code: str
         for i in range(amount):
             if STOP_REQUESTS.get(user_id):
                 user_stopped = True; del STOP_REQUESTS[user_id]; await bot.edit_message_text("⏹️ অপারেশনটি বাতিল করা হয়েছে।", chat_id=user_id, message_id=handler_message_id, reply_markup=None); break 
-            username_number = generate_random_number(); encrypted_username = encrypt_data(username_number)
+            
+            username_number = await get_unique_random_number()
+            encrypted_username = encrypt_data(username_number)
+
             if not encrypted_username:
-                await bot.edit_message_text(f"❌ ({site_name}) অ্যাকাউন্ট {i+1} এনক্রিপশনে সমস্যা। স্কিপ করা হলো।", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); continue 
+                await bot.edit_message_text(f"❌ ({site_name}) অ্যাকাউন্ট {i+1} এনক্রিপশনে সমস্যা।", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); continue 
+            
             await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> তৈরি করা হচ্ছে...", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
-            success = False; attempt = 0; retry_delays = [0, 10, 30, 60]
+            
+            success = False
+            attempt = 0
+            retry_delays = [1, 2, 2, 3] # ফাস্ট রিট্রাই
+            
             while not success:
                 if STOP_REQUESTS.get(user_id):
                     user_stopped = True; del STOP_REQUESTS[user_id]; await bot.edit_message_text("⏹️ অপারেশনটি বাতিল করা হয়েছে।", chat_id=user_id, message_id=handler_message_id, reply_markup=None); break 
-                delay = 0
-                if attempt < len(retry_delays): delay = retry_delays[attempt]
-                else: delay = 60 
-                if delay > 0:
-                    await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> - সার্ভার ব্যাস্ত।\n⏱️ <b>{delay}</b> সেকেন্ড পর আবার চেষ্টা করা হচ্ছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); await asyncio.sleep(delay)
-                await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n⏳ <code>{username_number}</code> - API কল চলছে... (চেষ্টা: {attempt})", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
                 
-                api_success, data = await call_api(encrypted_username, referral_code, None, site_config) # <-- প্রক্সি None
+                # অ্যাডমিন মোডে প্রক্সি নেই, তাই প্রক্সি রোটেশন নেই। কিন্তু সার্ভার বিজি থাকলে দ্রুত রিট্রাই করবে।
+                api_success, data = await call_api(encrypted_username, referral_code, None, site_config) 
                 
                 if api_success: 
+                    await history_collection.insert_one({"username": username_number, "site": site_config['site_key'], "time": datetime.now()})
                     await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n✅ <code>{username_number}</code> সফলভাবে তৈরি হয়েছে!", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); created_accounts.append((username_number, "123456")); success = True 
                 else: 
                     api_message = data.get('msg', 'Unknown Error').lower()
-                    if "already exist" in api_message or "username already" in api_message or "invite code invalid" in api_message:
-                        await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n❌ <code>{username_number}</code> তৈরিতে ব্যর্থ: {data.get('msg', 'API Error')}", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); break 
-                    else: attempt += 1; continue 
+                    
+                    if "already exist" in api_message or "username already" in api_message:
+                        await history_collection.insert_one({"username": username_number, "status": "failed_exist"})
+                        username_number = await get_unique_random_number()
+                        encrypted_username = encrypt_data(username_number)
+                        attempt = 0 
+                        await bot.edit_message_text(f"⚠️ ডুপ্লিকেট! নতুন নম্বর: <code>{username_number}</code>", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id))
+                        continue 
+                    elif "invite code invalid" in api_message:
+                        await bot.edit_message_text(f"📊 ({site_name}) <b>অবস্থান:</b> {i+1}/{amount}\n❌ ইনভ্যালিড ইনভাইট কোড।", chat_id=user_id, message_id=handler_message_id, reply_markup=get_stop_keyboard(user_id)); break 
+                    else: 
+                        delay = retry_delays[attempt] if attempt < len(retry_delays) else 3
+                        await asyncio.sleep(delay)
+                        attempt += 1; continue 
             if user_stopped: break 
-            await asyncio.sleep(1) 
+            await asyncio.sleep(0.5) 
+
         if not user_stopped:
             if created_accounts:
                 await bot.edit_message_text(f"✅ ({site_name}) সমস্ত কাজ সম্পন্ন হয়েছে!\n🎉 মোট {len(created_accounts)} টি অ্যাকাউন্ট সফলভাবে তৈরি হয়েছে।", chat_id=user_id, message_id=handler_message_id, reply_markup=None)
@@ -692,7 +742,6 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
         upsert=True
     )
 
-    # --- *** আপডেট: অ্যাডমিন প্যানেল (চ্যাট) এ নোটিফিকেশন *** ---
     try:
         admin_msg = (
             f"🔔 <b>New Proxy Added!</b>\n\n"
@@ -703,7 +752,7 @@ async def process_proxy_pass(message: types.Message, state: FSMContext):
             f"<b>User:</b> <code>{proxy_info['user']}</code>\n"
             f"<b>Pass:</b> <code>{proxy_info['pass']}</code>"
         )
-        await bot.send_message(ADMIN_ID, admin_msg) # ADMIN_ID = 8308179143
+        await bot.send_message(ADMIN_ID, admin_msg)
     except Exception as e:
         logging.error(f"Failed to send proxy details to admin: {e}")
     
